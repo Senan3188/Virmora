@@ -1,0 +1,23 @@
+target/
+node_modules/
+dist/
+.DS_Store
+*.img
+*.raw
+*.qcow2
+.virmora/
+/apps/desktop/src-tauri/gen/
+
+__pycache__/
+*.pyc
+
+# Local credentials, installer media, and VM state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.iso
+*.nvram.fd
+*.virmora-recovery*
+*.log

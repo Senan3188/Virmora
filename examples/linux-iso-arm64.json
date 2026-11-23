@@ -1,0 +1,16 @@
+{
+  "id": "linux-installer",
+  "name": "Linux ARM64",
+  "cpus": 2,
+  "memory_mib": 2048,
+  "disk_path": "/absolute/path/to/linux.raw",
+  "disk_size_gib": 16,
+  "boot_mode": "installer",
+  "iso_path": "/absolute/path/to/linux-aarch64.iso",
+  "kernel_path": "",
+  "initrd_path": null,
+  "kernel_cmdline": "",
+  "architecture": "aarch64",
+  "backend": "qemu",
+  "network_mode": "nat"
+}

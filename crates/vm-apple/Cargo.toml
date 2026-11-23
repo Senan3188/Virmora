@@ -1,0 +1,8 @@
+[package]
+name = "vm-apple"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vm-core.workspace = true

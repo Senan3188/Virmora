@@ -1,0 +1,13 @@
+{
+  "id": "linux-arm64",
+  "name": "Linux ARM64",
+  "cpus": 2,
+  "memory_mib": 2048,
+  "disk_path": "/absolute/path/to/linux.raw",
+  "disk_size_gib": 8,
+  "kernel_path": "/absolute/path/to/Image",
+  "initrd_path": "/absolute/path/to/initramfs",
+  "kernel_cmdline": "console=ttyAMA0 root=/dev/vda rw",
+  "architecture": "aarch64",
+  "backend": "qemu"
+}

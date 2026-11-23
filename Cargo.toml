@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/vm-core", "crates/vm-apple", "crates/vm-qemu", "crates/vm-manager", "crates/virmora-cli"]
+exclude = ["apps/desktop/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+vm-core = { path = "crates/vm-core" }
+vm-manager = { path = "crates/vm-manager" }
+vm-qemu = { path = "crates/vm-qemu" }
