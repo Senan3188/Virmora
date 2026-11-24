@@ -108,7 +108,7 @@ pub(crate) struct Monitor {
     reader: Option<JoinHandle<()>>,
 }
 impl Monitor {
-    pub fn new(pid: u32, disconnected: bool) -> Self {
+    pub fn new(pid: u32, mode: vm_core::NetworkMode) -> Self {
         let network = Arc::new(Mutex::new(NetworkSample {
             note: Some("Waiting for per-process network samples".into()),
             ..Default::default()
@@ -120,7 +120,7 @@ impl Monitor {
             collector: None,
             reader: None,
         };
-        if disconnected {
+        if mode == vm_core::NetworkMode::Disconnected {
             *monitor.network.lock().unwrap() = NetworkSample {
                 available: true,
                 rx_rate: Some(0.),
@@ -128,8 +128,11 @@ impl Monitor {
                 note: Some("VM network is disconnected".into()),
                 ..Default::default()
             };
-        } else {
+        } else if mode == vm_core::NetworkMode::Nat {
             monitor.start_network(pid);
+        } else {
+            monitor.network.lock().unwrap().note =
+                Some("Traffic counters are unavailable for this network mode.".into());
         }
         monitor
     }
@@ -489,17 +492,17 @@ mod tests {
     }
     #[test]
     fn disconnected_is_actual_zero_and_generations_reset() {
-        let mut first = Monitor::new(std::process::id(), true);
+        let mut first = Monitor::new(std::process::id(), vm_core::NetworkMode::Disconnected);
         let sample = first.sample(std::process::id());
         assert!(sample.network_available);
         assert_eq!(sample.network_rx_bytes, Some(0));
-        let second = Monitor::new(std::process::id(), true);
+        let second = Monitor::new(std::process::id(), vm_core::NetworkMode::Disconnected);
         assert_ne!(first.generation, second.generation);
         assert_eq!(second.network.lock().unwrap().rx, 0);
     }
     #[test]
     fn stale_collector_samples_are_unavailable_but_disconnected_stays_zero() {
-        let mut monitor = Monitor::new(std::process::id(), true);
+        let mut monitor = Monitor::new(std::process::id(), vm_core::NetworkMode::Disconnected);
         {
             let mut network = monitor.network.lock().unwrap();
             network.add(100, 10, Instant::now() - std::time::Duration::from_secs(6));
@@ -508,7 +511,7 @@ mod tests {
         assert!(!sample.network_available);
         assert_eq!(sample.network_rx_bytes, None);
         assert_eq!(sample.network_rx_bytes_per_sec, None);
-        let mut disconnected = Monitor::new(std::process::id(), true);
+        let mut disconnected = Monitor::new(std::process::id(), vm_core::NetworkMode::Disconnected);
         assert_eq!(
             disconnected.sample(std::process::id()).network_rx_bytes,
             Some(0)
@@ -520,7 +523,7 @@ mod tests {
     fn live_macos_process_cpu_and_network_stream() {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let address = socket.local_addr().unwrap();
-        let mut monitor = Monitor::new(std::process::id(), false);
+        let mut monitor = Monitor::new(std::process::id(), vm_core::NetworkMode::Nat);
         monitor.sample(std::process::id());
         let worker = std::thread::spawn(move || {
             let deadline = Instant::now() + std::time::Duration::from_secs(4);
@@ -555,7 +558,7 @@ mod tests {
     }
     #[test]
     fn collector_is_reaped_on_drop() {
-        let mut monitor = Monitor::new(std::process::id(), true);
+        let mut monitor = Monitor::new(std::process::id(), vm_core::NetworkMode::Disconnected);
         let child = Command::new("sleep").arg("30").spawn().unwrap();
         #[cfg(target_os = "macos")]
         let pid = child.id();

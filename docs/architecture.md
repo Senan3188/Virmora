@@ -1,6 +1,6 @@
 # Virmora architecture
 
-Virmora is a local, single-owner VM application. Rust owns configuration, storage and processes; React renders status and forwards typed Tauri commands. The Linux MVP supports direct kernel boot and UEFI ISO installation followed by installed-disk boot. Windows/macOS workflows and feature parity with Parallels remain future work.
+Virmora is a local, single-owner VM application. Rust owns configuration, storage and processes; React renders status and forwards typed Tauri commands. The Linux MVP supports direct kernel boot and UEFI ISO installation followed by installed-disk boot. The Windows 11 ARM64 preview adds a QEMU installer profile on Apple Silicon.
 
 ## Modules
 
@@ -15,7 +15,7 @@ Virmora is a local, single-owner VM application. Rust owns configuration, storag
 
 The user provides either an architecture-compatible Linux installer ISO or a compatible Linux kernel and optional initramfs. A raw disk is retained across stop and restart. Creating a blank disk does not install Linux: use an installer/initramfs to format and populate it, or supply a prepared raw root disk whose size matches the configured whole-GiB capacity. Existing disks are never truncated. For a prepared root filesystem, pass the appropriate `root=/dev/vda… rw` kernel arguments. The kernel needs virtio block/network and the relevant serial driver, either built in or in the initramfs. An ARM guest generally uses `console=ttyAMA0`; x86 uses `console=ttyS0`.
 
-The implemented network modes are Shared/NAT and Disconnected. Other saved selections (NAT Network, Bridged, Host-only and Internal) return explicit unsupported-mode errors on start. QEMU user networking provides guest DHCP and outbound NAT without administrator privileges. The guest must configure DHCP. Inbound ports, bridged networking, host directory sharing and guest agents are outside this milestone. Serial output is saved locally; the Unix serial socket supports interactive terminal access. UEFI guests have a virtio GPU and USB keyboard/tablet, with a separate native QEMU Cocoa guest window on macOS. The graphical display is not embedded in the Tauri UI; direct-kernel guests remain serial-first. CLI `run ID --headless` disables the graphical window.
+QEMU user networking provides DHCP and outbound NAT. On macOS, NAT Network, Bridged, and Host-only use the matching socket_vmnet service when present and otherwise try QEMU's native vmnet backend. The services provide vmnet access while keeping the desktop and QEMU unprivileged. Bridged uses the saved Mac adapter. Internal Network connects QEMU Ethernet streams through a Unix socket in a private, owner-only directory. It forwards frames between guests in one Virmora process and supplies no IP interface, DHCP, or internet gateway. Disconnected omits the NIC. Serial output is saved locally; the Unix serial socket supports interactive terminal access. UEFI guests have a virtio GPU and USB keyboard/tablet, with a separate native QEMU Cocoa guest window on macOS. The graphical display is not embedded in the Tauri UI; direct-kernel guests remain serial-first. CLI `run ID --headless` disables the graphical window.
 
 Boot selection is persisted as `boot_mode`: `installer` attaches the selected ISO read-only, `disk` omits it, and `auto` prioritizes a nonempty direct kernel path, then a selected ISO, then the disk. The manager only permits changing this setting while stopped and atomically writes the configuration without altering the disk. Desktop **Boot installer** / **Boot installed disk** controls and CLI `boot ID installer|disk|auto` share this operation. Disk boot ignores retained ISO references, including missing media. Installation completion is a user decision, not inferred from disk contents.
 
@@ -27,14 +27,14 @@ Stop requests ACPI poweroff over QMP and allows a bounded shutdown period; a gue
 
 Implement a separate macOS adapter using generated Objective-C bindings and an owned dispatch queue. Configure `VZLinuxBootLoader`, `VZVirtioBlockDeviceConfiguration`, `VZNATNetworkDeviceAttachment` and serial file-handle attachments, validate before start, and map asynchronous completions and delegate callbacks into backend state. The app must be signed with `com.apple.security.virtualization`. The native adapter remains a separate future milestone; the current tested execution path uses QEMU.
 
-Apple's framework virtualizes compatible host architectures; it does not provide cross-ISA emulation. macOS guests require an Apple-supported restore/install workflow and host hardware. Windows needs firmware, installation media, graphics and VirtIO drivers. Those installation profiles remain future work; the current UEFI flow is implemented for Linux guests.
+Apple's framework virtualizes compatible host architectures. macOS guests require an Apple-supported restore/install workflow and host hardware. The Windows 11 ARM64 QEMU profile uses AAVMF, a framebuffer, NVMe storage, USB installer media, and a per-VM swtpm process with persistent TPM state. An optional second ISO supplies ARM64 guest drivers.
 
 ## Next milestones
 
 1. Run the successful Apple Silicon/HVF guest userspace, DHCP, outbound HTTP and guest filesystem persistence smoke checks on Intel hardware and more distro profiles. See `docs/validation.md` for the separate Rust kernel-banner and Python guest tests.
 2. Add the native Apple Linux adapter with signed-host integration tests.
 3. Expand UEFI installation profiles and guest compatibility, add an embedded graphical console, and validate installed-disk workflows on Intel hardware. Linux ARM64 and x86_64 command profiles are implemented; Intel hardware is not yet tested.
-4. Add macOS restore/install and Windows ARM/x86 profiles, then snapshots, guest tools and sharing.
+4. Add macOS restore/install and Windows x64 profiles, then snapshots, guest tools and sharing.
 
 ## References
 

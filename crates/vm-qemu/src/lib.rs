@@ -5,31 +5,50 @@ use std::{
     fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
 pub mod metrics;
+mod tpm;
+pub mod vmnet;
 pub use metrics::VmMetrics;
-use vm_core::{BackendKind, GuestArchitecture, VmBackend, VmConfig, VmError, VmState};
+use vm_core::{
+    BackendKind, GuestArchitecture, GuestOs, NetworkMode, VmBackend, VmConfig, VmError, VmState,
+};
+
+#[cfg(unix)]
+mod internal_network;
 
 struct Instance {
     child: Child,
     failed: bool,
     monitor: Option<metrics::Monitor>,
+    tpm: Option<tpm::Tpm>,
 }
 
 pub struct QemuBackend {
     runtime_dir: PathBuf,
     instances: Mutex<HashMap<String, Instance>>,
     display: bool,
+    internal_socket: PathBuf,
+    #[cfg(unix)]
+    internal_network: Mutex<Option<internal_network::InternalNetwork>>,
 }
 
 impl QemuBackend {
     pub fn new(runtime_dir: PathBuf) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let internal_socket = runtime_dir
+            .join(format!("lan-{}-{sequence}", std::process::id()))
+            .join("lan.sock");
         Self {
             runtime_dir,
+            internal_socket,
+            #[cfg(unix)]
+            internal_network: Mutex::new(None),
             instances: Mutex::new(HashMap::new()),
             display: cfg!(target_os = "macos"),
         }
@@ -46,6 +65,22 @@ impl QemuBackend {
         PathBuf::from(path)
     }
     fn firmware_paths(config: &VmConfig) -> Result<(PathBuf, PathBuf), VmError> {
+        if config.guest_os == GuestOs::Windows11 {
+            let default_folder = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join("Library/Application Support/Virmora/Firmware"));
+            let resolve = |path: &Option<PathBuf>, filename: &str| {
+                path.clone().or_else(|| default_folder.as_ref().map(|folder| folder.join(filename)))
+                    .filter(|path| path.is_file())
+                    .ok_or_else(|| VmError::Backend(format!(
+                        "Windows ARM64 firmware {filename} is missing. Run scripts/setup-windows-firmware.sh or provide the firmware paths."
+                    )))
+            };
+            return Ok((
+                resolve(&config.firmware_code_path, "AAVMF_CODE.secboot.fd")?,
+                resolve(&config.firmware_vars_template_path, "AAVMF_VARS.ms.fd")?,
+            ));
+        }
         let (code_name, vars_name) = match config.architecture {
             GuestArchitecture::Aarch64 => ("edk2-aarch64-code.fd", "edk2-arm-vars.fd"),
             GuestArchitecture::X86_64 => ("edk2-x86_64-code.fd", "edk2-i386-vars.fd"),
@@ -120,6 +155,7 @@ impl QemuBackend {
         if instance.child.try_wait()?.is_some() {
             let generation = instance.monitor.as_ref().map(|m| m.generation).unwrap_or(0);
             instance.monitor = None;
+            instance.tpm = None;
             return Ok(VmMetrics::stopped(generation));
         }
         let pid = instance.child.id();
@@ -147,29 +183,73 @@ impl QemuBackend {
     fn qmp_path(&self, id: &str) -> Result<PathBuf, VmError> {
         Ok(self.directory(id)?.join("qmp.sock"))
     }
-    /// Build arguments without a shell, preserving paths containing spaces.
-    pub fn command_arguments(&self, config: &VmConfig) -> Result<(String, Vec<OsString>), VmError> {
-        let networking: Vec<OsString> = match config.network_mode {
-            vm_core::NetworkMode::Nat => vec![
-                "-netdev".into(),
-                "user,id=net0".into(),
-                "-device".into(),
-                if config.architecture == GuestArchitecture::Aarch64 {
-                    "virtio-net-pci,netdev=net0,romfile=".into()
-                } else {
-                    "virtio-net-pci,netdev=net0".into()
-                },
-            ],
-            vm_core::NetworkMode::Disconnected => vec!["-nic".into(), "none".into()],
-            mode => {
+    fn network_arguments(&self, config: &VmConfig) -> Result<Vec<OsString>, VmError> {
+        let mode = config.network_mode;
+        let backend = match mode {
+            NetworkMode::Nat => "user,id=net0".into(),
+            NetworkMode::Disconnected => return Ok(vec!["-nic".into(), "none".into()]),
+            NetworkMode::Internal if cfg!(unix) => format!(
+                "stream,id=net0,addr.type=unix,addr.path={},server=off",
+                escape_option(&self.internal_socket)?
+            ),
+            NetworkMode::NatNetwork if cfg!(target_os = "macos") => "vmnet-shared,id=net0".into(),
+            NetworkMode::HostOnly if cfg!(target_os = "macos") => "vmnet-host,id=net0".into(),
+            NetworkMode::Bridged if cfg!(target_os = "macos") => format!(
+                "vmnet-bridged,id=net0,ifname={}",
+                config
+                    .bridge_interface
+                    .as_deref()
+                    .unwrap_or("en0")
+                    .replace(',', ",,")
+            ),
+            _ => {
                 return Err(VmError::Backend(format!(
-                    "Network mode {mode:?} is not implemented yet. Choose NAT or Disconnected."
+                    "Network mode {mode:?} is unavailable on this host"
                 )))
             }
         };
+        let mut device = String::from("virtio-net-pci,netdev=net0");
+        if config.architecture == GuestArchitecture::Aarch64 {
+            device.push_str(",romfile=");
+        }
+        // Preserve the legacy NAT MAC. Shared networks need distinct addresses across VMs.
+        if mode != NetworkMode::Nat {
+            let hash = config
+                .id
+                .bytes()
+                .fold(0xcbf29ce484222325_u64, |hash, byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+                })
+                .to_be_bytes();
+            device.push_str(&format!(
+                ",mac=02:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                hash[3], hash[4], hash[5], hash[6], hash[7]
+            ));
+        }
+        Ok(vec![
+            "-netdev".into(),
+            backend.into(),
+            "-device".into(),
+            device.into(),
+        ])
+    }
+
+    /// Build arguments without a shell, preserving paths containing spaces.
+    pub fn command_arguments(&self, config: &VmConfig) -> Result<(String, Vec<OsString>), VmError> {
+        let windows = config.guest_os == GuestOs::Windows11;
+        if windows && !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            return Err(VmError::Backend(
+                "This Windows profile requires an Apple Silicon Mac".into(),
+            ));
+        }
+        let networking = self.network_arguments(config)?;
         let dir = self.directory(&config.id)?;
         #[cfg(unix)]
-        for name in ["serial.sock", "qmp.sock"] {
+        for name in [
+            "serial.sock",
+            "qmp.sock",
+            if windows { "tpm.sock" } else { "qmp.sock" },
+        ] {
             use std::os::unix::ffi::OsStrExt;
             if dir.join(name).as_os_str().as_bytes().len() > 103 {
                 return Err(VmError::InvalidConfig(
@@ -201,9 +281,17 @@ impl QemuBackend {
             "-name".into(),
             format!("guest={}", config.name.replace(',', ",,")).into(),
             "-machine".into(),
-            machine.into(),
+            if windows {
+                "virt,gic-version=2,acpi=on".into()
+            } else {
+                machine.into()
+            },
             "-accel".into(),
-            if accelerated {
+            if windows {
+                // The ARM64 Windows boot manager stalls with the default GICv3
+                // on the tested Apple Silicon host. GICv2 needs userspace IRQs.
+                "hvf,kernel-irqchip=off".into()
+            } else if accelerated {
                 "hvf".into()
             } else {
                 "tcg".into()
@@ -263,15 +351,19 @@ impl QemuBackend {
                 )
                 .into(),
                 "-device".into(),
-                "virtio-gpu-pci,id=display0,addr=0x6".into(),
+                if windows {
+                    // Keep firmware graphics available to Windows Setup before
+                    // a guest display driver has been installed.
+                    "ramfb".into()
+                } else {
+                    "virtio-gpu-pci,id=display0,addr=0x6".into()
+                },
                 "-device".into(),
                 "qemu-xhci,id=usb0,addr=0x7".into(),
                 "-device".into(),
                 "usb-kbd".into(),
                 "-device".into(),
                 "usb-tablet".into(),
-                "-device".into(),
-                "virtio-scsi-pci,id=scsi0,addr=0x8".into(),
                 "-drive".into(),
                 format!(
                     "file={},format=raw,if=none,id=osdisk",
@@ -280,11 +372,45 @@ impl QemuBackend {
                 .into(),
                 "-device".into(),
                 format!(
-                    "virtio-blk-pci,drive=osdisk,id=osdisk-device,addr=0x9,bootindex={}",
+                    "{},drive=osdisk,id=osdisk-device,addr=0x9,bootindex={}",
+                    if windows {
+                        "nvme,serial=VIRMORA0001"
+                    } else {
+                        "virtio-blk-pci"
+                    },
                     if config.installer_boot() { 2 } else { 1 }
                 )
                 .into(),
             ]);
+            if windows {
+                args.extend([
+                    "-chardev".into(),
+                    format!(
+                        "socket,id=tpm-control,path={}",
+                        escape_option(&dir.join("tpm.sock"))?
+                    )
+                    .into(),
+                    "-tpmdev".into(),
+                    "emulator,id=tpm0,chardev=tpm-control".into(),
+                    "-device".into(),
+                    "tpm-tis-device,tpmdev=tpm0,ppi=off".into(),
+                ]);
+                if let Some(drivers) = &config.drivers_iso_path {
+                    args.extend([
+                        "-drive".into(),
+                        format!(
+                            "file={},format=raw,media=cdrom,readonly=on,if=none,id=drivers",
+                            escape_option(drivers)?
+                        )
+                        .into(),
+                        "-device".into(),
+                        "usb-storage,drive=drivers,bus=usb0.0,port=4,id=windows-drivers".into(),
+                    ]);
+                }
+            } else {
+                // Keep the controller at the same PCI address across Linux boot modes.
+                args.extend(["-device".into(), "virtio-scsi-pci,id=scsi0,addr=0x8".into()]);
+            }
             if config.installer_boot() {
                 let iso = config.iso_path.as_ref().ok_or_else(|| {
                     VmError::InvalidConfig("Installer boot requires an ISO".into())
@@ -297,7 +423,11 @@ impl QemuBackend {
                     )
                     .into(),
                     "-device".into(),
-                    "scsi-cd,drive=cd0,bus=scsi0.0,id=installer-cd,bootindex=1".into(),
+                    if windows {
+                        "usb-storage,drive=cd0,bus=usb0.0,port=3,id=installer-cd,bootindex=1".into()
+                    } else {
+                        "scsi-cd,drive=cd0,bus=scsi0.0,id=installer-cd,bootindex=1".into()
+                    },
                 ]);
             }
         }
@@ -374,6 +504,7 @@ impl VmBackend for QemuBackend {
                 return Err(VmError::Backend("VM is already running".into()));
             }
         }
+        instances.remove(&config.id);
         let dir = self.directory(&config.id)?;
         fs::create_dir_all(&dir)?;
         for socket in [dir.join("qmp.sock"), dir.join("serial.sock")] {
@@ -381,12 +512,42 @@ impl VmBackend for QemuBackend {
                 fs::remove_file(socket)?;
             }
         }
+        #[cfg(unix)]
+        if config.network_mode == NetworkMode::Internal {
+            use std::os::unix::ffi::OsStrExt;
+            if self.internal_socket.as_os_str().as_bytes().len() > 103 {
+                return Err(VmError::InvalidConfig(
+                    "Internal Network socket path is too long. Choose a shorter Virmora data directory.".into(),
+                ));
+            }
+            let mut network = self
+                .internal_network
+                .lock()
+                .map_err(|_| VmError::Backend("Internal Network lock poisoned".into()))?;
+            if network.is_none() {
+                *network = Some(internal_network::InternalNetwork::start(
+                    &self.internal_socket,
+                )?);
+            }
+        }
         let errors = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(dir.join("qemu.log"))?;
-        let child = Command::new(binary)
-            .args(args)
+        let socket = vmnet::socket_path(
+            config.network_mode,
+            config.bridge_interface.as_deref().unwrap_or("en0"),
+        );
+        let tpm = if config.guest_os == GuestOs::Windows11 {
+            Some(tpm::Tpm::start(
+                &dir.join("tpm.sock"),
+                &config.tpm_state_path(),
+                &dir.join("qemu.log"),
+            )?)
+        } else {
+            None
+        };
+        let child = vmnet::command(&binary, args, socket.as_deref())?
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(errors)
@@ -402,30 +563,38 @@ impl VmBackend for QemuBackend {
                 child,
                 failed: false,
                 monitor: None,
+                tpm,
             },
         );
         // A running child is insufficient: QEMU can fail while binding its
-        // sockets or initializing devices. Wait for an actual QMP greeting.
+        // sockets or initializing devices. Wait until QMP can answer a command.
         let deadline = Instant::now() + Duration::from_secs(3);
         let instance = instances.get_mut(&config.id).unwrap();
         loop {
             if let Some(status) = instance.child.try_wait()? {
+                instance.tpm = None;
                 instance.failed = true;
+                let hint = match config.network_mode {
+                    NetworkMode::NatNetwork | NetworkMode::HostOnly | NetworkMode::Bridged =>
+                        " The selected mode requires its socket_vmnet service or a QEMU build authorized for macOS vmnet. Check the log for permission or interface errors.",
+                    _ => "",
+                };
                 return Err(VmError::Backend(format!(
-                    "QEMU exited during startup ({status}); see {}",
+                    "QEMU exited during startup ({status}).{hint} Log: {}",
                     dir.join("qemu.log").display()
                 )));
             }
             if qmp_ready(&dir.join("qmp.sock")) {
                 instance.monitor = Some(metrics::Monitor::new(
                     instance.child.id(),
-                    config.network_mode == vm_core::NetworkMode::Disconnected,
+                    config.network_mode,
                 ));
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 let _ = instance.child.kill();
                 let _ = instance.child.wait();
+                instance.tpm = None;
                 instance.failed = true;
                 return Err(VmError::Backend(format!(
                     "QEMU did not become ready within 3 seconds; see {}",
@@ -517,6 +686,7 @@ impl VmBackend for QemuBackend {
             None => Ok(VmState::Running),
             Some(status) => {
                 instance.monitor = None;
+                instance.tpm = None;
                 instance.failed |= !status.success();
                 Ok(if instance.failed {
                     VmState::Failed
@@ -532,11 +702,20 @@ impl VmBackend for QemuBackend {
 }
 
 #[cfg(unix)]
-fn qmp_request(path: &Path, mut request: serde_json::Value) -> Result<serde_json::Value, VmError> {
+fn qmp_request(path: &Path, request: serde_json::Value) -> Result<serde_json::Value, VmError> {
+    qmp_request_with_timeout(path, request, Duration::from_secs(3))
+}
+
+#[cfg(unix)]
+fn qmp_request_with_timeout(
+    path: &Path,
+    mut request: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, VmError> {
     use std::os::unix::net::UnixStream;
     let mut stream = UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     fn receive(
         reader: &mut BufReader<UnixStream>,
@@ -584,24 +763,12 @@ fn qmp_request(_: &Path, _: serde_json::Value) -> Result<serde_json::Value, VmEr
 
 #[cfg(unix)]
 fn qmp_ready(path: &Path) -> bool {
-    use std::os::unix::net::UnixStream;
-    let Ok(stream) = UnixStream::connect(path) else {
-        return false;
-    };
-    if stream
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .is_err()
-    {
-        return false;
-    }
-    let mut line = String::new();
-    if BufReader::new(stream).read_line(&mut line).is_err() {
-        return false;
-    }
-    serde_json::from_str::<serde_json::Value>(&line)
-        .ok()
-        .and_then(|v| v.get("QMP").cloned())
-        .is_some()
+    qmp_request_with_timeout(
+        path,
+        serde_json::json!({"execute": "query-status"}),
+        Duration::from_millis(100),
+    )
+    .is_ok()
 }
 #[cfg(not(unix))]
 fn qmp_ready(_: &Path) -> bool {
@@ -646,8 +813,11 @@ impl Drop for QemuBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     fn config(architecture: GuestArchitecture) -> VmConfig {
         VmConfig {
+            guest_os: vm_core::GuestOs::Linux,
+            drivers_iso_path: None,
             id: "linux".into(),
             name: "Linux".into(),
             cpus: 2,
@@ -664,6 +834,7 @@ mod tests {
             firmware_vars_template_path: None,
             backend: BackendKind::Qemu,
             network_mode: vm_core::NetworkMode::Nat,
+            bridge_interface: None,
         }
     }
     fn firmware_config() -> (VmConfig, PathBuf) {
@@ -728,6 +899,52 @@ mod tests {
         assert!(args.contains(&OsString::from(
             "virtio-blk-pci,drive=osdisk,id=osdisk-device,addr=0x9,bootindex=1"
         )));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn windows_installer_and_disk_boot_use_the_same_guest_hardware() {
+        let (mut cfg, root) = firmware_config();
+        cfg.guest_os = GuestOs::Windows11;
+        cfg.memory_mib = 4096;
+        cfg.disk_size_gib = 64;
+        cfg.boot_mode = vm_core::BootMode::Installer;
+        cfg.iso_path = Some(root.join("windows.iso"));
+        cfg.drivers_iso_path = Some(root.join("drivers.iso"));
+        fs::write(cfg.iso_path.as_ref().unwrap(), b"installer").unwrap();
+        fs::write(cfg.drivers_iso_path.as_ref().unwrap(), b"drivers").unwrap();
+        cfg.validate().unwrap();
+        let backend = QemuBackend::with_display("/tmp/virmora".into(), false);
+        let (_, installer) = backend.command_arguments(&cfg).unwrap();
+
+        cfg.boot_mode = vm_core::BootMode::Disk;
+        fs::remove_file(cfg.iso_path.as_ref().unwrap()).unwrap();
+        cfg.validate().unwrap();
+        let (_, disk) = backend.command_arguments(&cfg).unwrap();
+
+        for args in [&installer, &disk] {
+            assert!(args.contains(&"virt,gic-version=2,acpi=on".into()));
+            assert!(args.contains(&"hvf,kernel-irqchip=off".into()));
+            assert!(args.contains(&"ramfb".into()));
+            assert!(args.contains(&"tpm-tis-device,tpmdev=tpm0,ppi=off".into()));
+            assert!(args.contains(
+                &"usb-storage,drive=drivers,bus=usb0.0,port=4,id=windows-drivers".into()
+            ));
+        }
+        assert!(installer.contains(
+            &"usb-storage,drive=cd0,bus=usb0.0,port=3,id=installer-cd,bootindex=1".into()
+        ));
+        assert!(!disk
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("id=cd0")));
+        for (args, index) in [(installer, 2), (disk, 1)] {
+            assert!(args.contains(
+                &format!(
+                "nvme,serial=VIRMORA0001,drive=osdisk,id=osdisk-device,addr=0x9,bootindex={index}"
+            )
+                .into()
+            ));
+        }
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -804,18 +1021,23 @@ mod tests {
             .windows(2)
             .any(|a| a == [OsString::from("-nic"), OsString::from("none")]));
         assert!(!args.contains(&OsString::from("-netdev")));
-        for mode in [
-            vm_core::NetworkMode::Bridged,
-            vm_core::NetworkMode::HostOnly,
-            vm_core::NetworkMode::Internal,
-            vm_core::NetworkMode::NatNetwork,
+        for (mode, prefix) in [
+            (NetworkMode::Internal, "stream,id=net0,addr.type=unix,"),
+            (NetworkMode::NatNetwork, "vmnet-shared,id=net0"),
+            (NetworkMode::HostOnly, "vmnet-host,id=net0"),
+            (NetworkMode::Bridged, "vmnet-bridged,id=net0,ifname=en3"),
         ] {
             cfg.network_mode = mode;
-            assert!(backend
-                .command_arguments(&cfg)
-                .unwrap_err()
-                .to_string()
-                .contains("not implemented"));
+            cfg.bridge_interface = Some("en3".into());
+            if cfg!(target_os = "macos") || (cfg!(unix) && mode == NetworkMode::Internal) {
+                let (_, args) = backend.command_arguments(&cfg).unwrap();
+                assert!(args
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().starts_with(prefix)));
+                assert!(!args.iter().any(|arg| arg == "user,id=net0"));
+            } else {
+                assert!(backend.command_arguments(&cfg).is_err());
+            }
         }
     }
     #[test]
@@ -859,6 +1081,7 @@ mod tests {
                 child,
                 failed: false,
                 monitor: None,
+                tpm: None,
             },
         );
         backend.stop("sleep").unwrap();
@@ -872,13 +1095,14 @@ mod tests {
             std::process::id()
         )));
         let child = Command::new("sleep").arg("30").spawn().unwrap();
-        let monitor = metrics::Monitor::new(child.id(), true);
+        let monitor = metrics::Monitor::new(child.id(), NetworkMode::Disconnected);
         backend.instances.lock().unwrap().insert(
             "guest".into(),
             Instance {
                 child,
                 failed: false,
                 monitor: Some(monitor),
+                tpm: None,
             },
         );
         assert!(backend.shutdown("guest").is_err());
@@ -931,6 +1155,7 @@ mod tests {
                 child,
                 failed: false,
                 monitor: None,
+                tpm: None,
             },
         );
         backend.shutdown("guest").unwrap();

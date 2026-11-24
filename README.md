@@ -1,6 +1,6 @@
 # Virmora
 
-Rust VM manager with QEMU, a Tauri 2 / React desktop client, and an explicit extension point for Apple Virtualization.framework. The Linux MVP implements UEFI ISO installation, boot from an installed disk, direct kernel boot, retained raw disks and NVRAM, outbound NAT, graphical guest windows, serial console and start/stop lifecycle. Windows/macOS guests and the native Apple backend are roadmap work.
+Rust VM manager with QEMU, a Tauri 2 / React desktop client, and an explicit extension point for Apple Virtualization.framework. Virmora supports Linux ISO installation, installed-disk boot, direct kernel boot, persistent storage, networking, and graphical and serial consoles. The Windows 11 ARM64 preview adds an ISO installation profile for Apple Silicon Macs.
 
 ## Requirements
 
@@ -53,9 +53,35 @@ Use `run MACHINE_ID --headless` to suppress the graphical window. Firmware insta
 
 UEFI firmware is discovered from the separately installed QEMU package in `/opt/homebrew/share/qemu`, `/usr/local/share/qemu`, or `/usr/share/qemu`. Optional absolute `firmware_code_path` and `firmware_vars_template_path` configuration fields override discovery. ARM64 uses `edk2-aarch64-code.fd` with `edk2-arm-vars.fd`; x86_64 uses `edk2-x86_64-code.fd` with `edk2-i386-vars.fd`. A VM's variables template is copied once to `<disk-path>.nvram.fd` (for example `disk.raw.nvram.fd`); subsequent boots retain its UEFI settings and boot entries. Keep this file together with the disk when backing up an installed machine. Firmware is not redistributed by Virmora.
 
-Shared/NAT and Disconnected networking are implemented. The other network choices are planned and return an explicit unsupported-mode error on start.
+Choose a network when creating a VM or under **Edit settings → Network** while the VM is stopped. The change applies at the next start.
+
+- **Shared / NAT** uses QEMU user-mode networking and supplies guest DHCP.
+- **NAT Network** uses macOS vmnet shared networking for peers on the same subnet and outbound internet.
+- **Bridged** attaches the VM to the selected Mac network adapter. An active bridge-capable adapter and a LAN that accepts additional devices are required.
+- **Host-only** uses macOS vmnet to connect the host and guests on a private network.
+- **Internal Network** connects VMs owned by the same Virmora process without a host IP interface, gateway, or DHCP server. Assign static IP addresses on the same subnet in the guests.
+- **Disconnected** removes the virtual NIC.
+
+NAT Network, Bridged, and Host-only can use the macOS socket_vmnet services or a QEMU binary already authorized for vmnet. See the [desktop setup instructions](apps/desktop/README.md#authorize-the-macos-network-services). Use **Check network** in VM settings to verify the selected backend.
 
 See `apps/desktop/README.md` for desktop controls and packaging. Tauri dependencies are isolated in their own Cargo workspace. The desktop and CLI use the same VM types and manager; use one at a time for a data directory.
+
+## Windows 11 ARM64 preview
+
+With QEMU installed, prepare the Apple Silicon host from the repository root:
+
+```sh
+brew install swtpm
+bash scripts/setup-windows-firmware.sh
+```
+
+The script installs Debian's AAVMF firmware with a Microsoft-key UEFI variables template into your user Library. Virmora starts a software TPM 2.0 for each Windows VM and exposes an NVMe disk and a firmware framebuffer to Windows Setup.
+
+In **Create Machine**, choose **Windows 11 ARM64 (preview)** and select the [official Microsoft ARM64 ISO](https://www.microsoft.com/en-us/software-download/windows11arm64) under **ISO Image**. The profile supports 2–8 CPUs and requires at least 4 GiB RAM and a 64 GiB virtual disk. Start the VM and press a key in its window if prompted to boot from the installer. To supply drivers for the virtual network adapter, attach an ISO containing signed Windows ARM64 VirtIO network drivers in **Windows driver ISO**. You can change or eject it in **Edit settings** while the VM is stopped.
+
+After Windows installs, shut down the guest and choose **Boot installed disk** in Virmora. This detaches the installer on subsequent starts. Back up the disk together with its `.nvram.fd` and `.tpm-state` sidecars. Windows x64 and macOS guests remain future work.
+
+The official ISO reached graphical Windows Setup and detected the NVMe disk on Apple M1. Full installation and the first boot from the installed disk are pending. See [validation](docs/validation.md#windows-11-arm64-setup) for the exact setup tested.
 
 ## Validation
 

@@ -227,7 +227,9 @@ impl VmManager {
         vm.config.cpus = update.cpus;
         vm.config.memory_mib = update.memory_mib;
         vm.config.network_mode = update.network_mode;
+        vm.config.bridge_interface = update.bridge_interface;
         vm.config.iso_path = update.iso_path;
+        vm.config.drivers_iso_path = update.drivers_iso_path;
         if vm.config.iso_path.is_none() && vm.config.boot_mode == BootMode::Installer {
             vm.config.boot_mode = BootMode::Disk;
         }
@@ -410,12 +412,17 @@ impl VmManager {
         } else {
             let others = self.list()?;
             let mut targets = Vec::new();
-            for target in [&vm.config.disk_path, &nvram] {
+            let tpm = vm.config.tpm_state_path();
+            let mut files = vec![&vm.config.disk_path, &nvram];
+            if vm.config.guest_os == vm_core::GuestOs::Windows11 {
+                files.push(&tpm);
+            }
+            for target in files {
                 match fs::symlink_metadata(target) {
                     Ok(metadata) => {
                         if !metadata.file_type().is_file() {
                             return Err(VmError::InvalidConfig(
-                                "refusing to delete a disk or NVRAM symlink or non-file".into(),
+                                "refusing to delete a VM file that is a symlink or non-file".into(),
                             ));
                         }
                         #[cfg(unix)]
@@ -433,6 +440,7 @@ impl VmManager {
                                 Some(&other.config.kernel_path),
                                 other.config.initrd_path.as_ref(),
                                 other.config.iso_path.as_ref(),
+                                other.config.drivers_iso_path.as_ref(),
                                 other.config.firmware_code_path.as_ref(),
                                 other.config.firmware_vars_template_path.as_ref(),
                             ];
@@ -443,7 +451,8 @@ impl VmManager {
                             }
                             if other.config.id != id
                                 && (same_file(target, &other.config.disk_path)
-                                    || same_file(target, &other_nvram))
+                                    || same_file(target, &other_nvram)
+                                    || same_file(target, &other.config.tpm_state_path()))
                             {
                                 return Err(VmError::InvalidConfig(
                                     "refusing to delete a file attached to another VM".into(),
@@ -592,6 +601,8 @@ mod tests {
             let kernel = self.0.join("kernel");
             fs::write(&kernel, b"test-kernel").unwrap();
             VmConfig {
+                guest_os: vm_core::GuestOs::Linux,
+                drivers_iso_path: None,
                 id: "linux".into(),
                 name: "Linux".into(),
                 cpus: 2,
@@ -608,6 +619,7 @@ mod tests {
                 firmware_vars_template_path: None,
                 backend: BackendKind::Qemu,
                 network_mode: vm_core::NetworkMode::Nat,
+                bridge_interface: None,
             }
         }
     }
@@ -670,7 +682,9 @@ mod tests {
             cpus: 3,
             memory_mib: 768,
             network_mode: vm_core::NetworkMode::Disconnected,
+            bridge_interface: None,
             iso_path: None,
+            drivers_iso_path: None,
         };
         manager.start("linux").unwrap();
         assert!(manager.update_settings("linux", update()).is_err());
@@ -740,6 +754,47 @@ mod tests {
         assert!(!nvram.exists());
         assert!(iso.is_file());
         assert!(config.kernel_path.is_file());
+    }
+
+    #[test]
+    fn windows_driver_eject_and_disk_retention_preserve_tpm_state() {
+        let temp = Temp::new();
+        let mut config = temp.config();
+        config.guest_os = vm_core::GuestOs::Windows11;
+        config.architecture = vm_core::GuestArchitecture::Aarch64;
+        config.kernel_path.clear();
+        config.memory_mib = 4096;
+        config.disk_size_gib = 64;
+        config.boot_mode = BootMode::Disk;
+        let drivers = temp.0.join("drivers.iso");
+        fs::write(&drivers, b"drivers").unwrap();
+        config.drivers_iso_path = Some(drivers.clone());
+        let manager = VmManager::new(&temp.0, Arc::new(Mock::default())).unwrap();
+        manager.create(config.clone()).unwrap();
+        let tpm = config.tpm_state_path();
+        fs::write(&tpm, b"TPM state").unwrap();
+
+        let update = VmSettingsUpdate {
+            name: config.name,
+            cpus: config.cpus,
+            memory_mib: config.memory_mib,
+            network_mode: config.network_mode,
+            bridge_interface: None,
+            iso_path: None,
+            drivers_iso_path: None,
+        };
+        let edited = manager.update_settings(&config.id, update).unwrap();
+        assert_eq!(edited.config.drivers_iso_path, None);
+        assert_eq!(edited.config.boot_mode, BootMode::Disk);
+        manager.delete(&config.id, true).unwrap();
+        assert_eq!(fs::read(&tpm).unwrap(), b"TPM state");
+
+        let recovery = append_path(&config.disk_path, ".virmora-recovery");
+        let restored = serde_json::from_slice(&fs::read(recovery).unwrap()).unwrap();
+        manager.create(restored).unwrap();
+        manager.delete(&config.id, false).unwrap();
+        assert!(!tpm.exists());
+        assert_eq!(fs::read(drivers).unwrap(), b"drivers");
     }
 
     #[test]

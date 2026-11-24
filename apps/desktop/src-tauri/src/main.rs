@@ -27,7 +27,43 @@ struct CreateVm {
     iso_path: Option<PathBuf>,
     architecture: GuestArchitecture,
     #[serde(default)]
+    guest_os: vm_core::GuestOs,
+    drivers_iso_path: Option<PathBuf>,
+    #[serde(default)]
     network_mode: vm_core::NetworkMode,
+    #[serde(default)]
+    bridge_interface: Option<String>,
+}
+#[tauri::command]
+async fn list_bridge_interfaces() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let output = std::process::Command::new("/sbin/ifconfig")
+            .arg("-l")
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err("Could not list Mac network adapters".into());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .filter(|name| {
+                name.strip_prefix("en")
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .map(str::to_owned)
+            .collect())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+#[tauri::command]
+async fn check_network(
+    mode: vm_core::NetworkMode,
+    adapter: String,
+) -> Result<vm_qemu::vmnet::NetworkReadiness, String> {
+    tauri::async_runtime::spawn_blocking(move || vm_qemu::vmnet::readiness(mode, &adapter))
+        .await
+        .map_err(|error| error.to_string())
 }
 #[tauri::command]
 fn list_vms(state: State<'_, Desktop>) -> Result<Vec<VmInfo>, String> {
@@ -35,6 +71,9 @@ fn list_vms(state: State<'_, Desktop>) -> Result<Vec<VmInfo>, String> {
 }
 #[tauri::command]
 fn create_vm(state: State<'_, Desktop>, request: CreateVm) -> Result<VmInfo, String> {
+    if request.guest_os == vm_core::GuestOs::Windows11 && !cfg!(target_arch = "aarch64") {
+        return Err("The Windows 11 ARM64 profile requires an Apple Silicon Mac".into());
+    }
     let iso_path = request
         .iso_path
         .ok_or("Select an ISO image before creating a machine")?;
@@ -54,8 +93,9 @@ fn create_vm(state: State<'_, Desktop>, request: CreateVm) -> Result<VmInfo, Str
     }
     let parent = fs::canonicalize(parent).map_err(|e| e.to_string())?;
     let machine_directory = parent.join(&id);
-    fs::create_dir_all(&machine_directory).map_err(|e| e.to_string())?;
     let config = VmConfig {
+        guest_os: request.guest_os,
+        drivers_iso_path: request.drivers_iso_path,
         disk_path: machine_directory.join("disk.raw"),
         id,
         name: request.name,
@@ -69,10 +109,13 @@ fn create_vm(state: State<'_, Desktop>, request: CreateVm) -> Result<VmInfo, Str
         architecture: request.architecture,
         backend: BackendKind::Qemu,
         network_mode: request.network_mode,
+        bridge_interface: request.bridge_interface,
         boot_mode: BootMode::Installer,
         firmware_code_path: None,
         firmware_vars_template_path: None,
     };
+    config.validate().map_err(|error| error.to_string())?;
+    fs::create_dir_all(&machine_directory).map_err(|error| error.to_string())?;
     state.manager.create(config).map_err(|e| e.to_string())
 }
 #[tauri::command]
@@ -300,6 +343,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             list_vms,
+            list_bridge_interfaces,
+            check_network,
             create_vm,
             start_vm,
             shutdown_vm,

@@ -5,6 +5,7 @@ dist/
 *.img
 *.raw
 *.qcow2
+*.vhdx
 .virmora/
 /apps/desktop/src-tauri/gen/
 
@@ -18,6 +19,8 @@ __pycache__/
 *.pem
 *.key
 *.iso
-*.nvram.fd
+*.fd
 *.virmora-recovery*
 *.log
+
+*.tpm-state

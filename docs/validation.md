@@ -40,7 +40,7 @@ VIRMORA_TEST_KERNEL=/absolute/kernel VIRMORA_TEST_INITRD=/absolute/initramfs car
 
 ## Remaining verification
 
-Intel macOS and x86 guests have not been exercised on hardware. Native Apple virtualization, Windows/macOS guest installations, signed distributable packaging and power-loss recovery are not implemented or validated by this milestone. Graphical ARM64 Linux installation and installed-disk boot have now been exercised as described below. Desktop compile and launch results should be checked separately from the Rust headless suite.
+Intel macOS and x86 guests have not been exercised on hardware. Native Apple virtualization, macOS guest installation, signed distributable packaging, and power-loss recovery are outside this milestone. Graphical ARM64 Linux installation and installed-disk boot were exercised as described below. Desktop compile and launch results should be checked separately from the Rust headless suite.
 
 
 ## UEFI ISO installation and installed-disk boot
@@ -65,6 +65,12 @@ python3 scripts/smoke-iso-install.py /tmp/alpine-virt-3.23.8-aarch64.iso --sha25
 
 The test creates its own new `/tmp/virmora-iso-*` directory and only formats that guest disk. It retains artifacts rather than deleting them. Package installation requires guest outbound internet access. Native Cocoa display and Unix sockets require an unsandboxed macOS session. It is opt-in rather than part of headless CI. This validates ARM64 Linux, not Windows/macOS guests or native Intel hardware.
 
+## Windows 11 ARM64 Setup
+
+The Microsoft Windows 11 26H2 ARM64 English image (build 26300.9457) reached graphical Windows Setup on macOS 26.6.2 with an Apple M1, QEMU 11.1.2, Debian AAVMF 2025.02, and swtpm 0.10.2. The VM used 2 vCPUs, 4 GiB RAM, a 64 GiB sparse raw disk, and the QEMU framebuffer. Windows PE's `diskpart list disk` showed the NVMe system disk online with 64 GB free.
+
+QEMU first stalled during the Windows boot-manager handoff with GICv3. GICv2 with `hvf,kernel-irqchip=off` reached Setup and is now the Windows profile default. QMP confirmed the TPM device, and a separate stop/start check verified that disk mode detaches the installer and retains the TPM state. Completing Windows Setup, validating the guest network driver, and booting a finished Windows installation remain pending.
+
 Firmware boots use fixed PCI addresses and explicit disk/CD boot priorities so ejecting the installer does not move the installed disk. Per-VM NVRAM is preserved; malformed or symlinked NVRAM is rejected rather than overwritten. QEMU firmware is supplied by the separately installed QEMU package.
 
 A separate x86_64 UEFI smoke test also passed on this ARM host using TCG: the guest rendered the firmware shell, QMP reported Running, and PCI inspection found exactly one graphics adapter. Artifacts: `/tmp/virmora-x86-9sskk9sd/firmware.png`. This is firmware validation under emulation, not an x86 Linux installation or native Intel hardware test.
@@ -72,3 +78,23 @@ A separate x86_64 UEFI smoke test also passed on this ARM host using TCG: the gu
 ## Resource monitoring
 
 The real monitoring workload test passed on an ARM64 Linux VM with HVF. CPU readings rose to 98.9% under a busy loop, QEMU physical footprint grew after a 64 MiB guest allocation, and a local 16 MiB HTTP transfer produced live receive/send counters and rates. Verified samples: `/tmp/vm-monitor-j9e_674i/verified-samples.json`. Monitoring measures the QEMU host process, not guest-internal used RAM. See [monitoring details](monitoring.md) for scope, limitations and repeat commands.
+
+## VM network modes
+
+An opt-in test booted two ARM64 Alpine guests on one Internal Network, assigned static IP addresses, and verified guest-to-guest ping with no IPv4 default route. Run it with the same Alpine virt kernel and initramfs used for the direct boot smoke test:
+
+```sh
+VIRMORA_TEST_KERNEL=/absolute/path/to/vmlinuz-virt \
+VIRMORA_TEST_INITRD=/absolute/path/to/initramfs-virt \
+cargo test -p vm-qemu --test internal_network -- --ignored
+```
+
+The bundled Homebrew QEMU on the test Mac listed all three macOS vmnet backends, but macOS denied creation of an unprivileged shared interface. NAT Network, Host-only, and Bridged still need an end-to-end test with a QEMU build authorized to use vmnet.
+
+The socket_vmnet client (Homebrew 1.2.2) passed an unprivileged transport check on macOS using a disposable Unix socket. QEMU accepted the inherited socket and completed the QMP startup and shutdown exchange. This check did not start the privileged vmnet services.
+
+After authorizing the services, use **Check network** for each mode and then verify guest connectivity:
+
+- **NAT Network**. Boot two guests on NAT Network, confirm both get DHCP addresses on the shared subnet, ping one guest from the other, and fetch an HTTPS page from a guest.
+- **Host-only**. Boot a guest on Host-only and ping its DHCP address from the Mac.
+- **Bridged**. Choose the active physical adapter in Edit Settings, boot a guest, and check that it receives an address from the LAN's DHCP server. Ping a known LAN peer that accepts ICMP.

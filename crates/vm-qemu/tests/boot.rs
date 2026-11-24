@@ -40,6 +40,8 @@ fn boots_linux_and_preserves_disk_across_restart() {
         _ => GuestArchitecture::X86_64,
     };
     let config = VmConfig {
+        guest_os: vm_core::GuestOs::Linux,
+        drivers_iso_path: None,
         id: "smoke".into(),
         name: "Smoke Linux".into(),
         cpus: 2,
@@ -59,6 +61,7 @@ fn boots_linux_and_preserves_disk_across_restart() {
         firmware_vars_template_path: None,
         backend: BackendKind::Qemu,
         network_mode: vm_core::NetworkMode::Nat,
+        bridge_interface: None,
     };
     let backend = QemuBackend::new(root.join("runtime"));
     for _ in 0..2 {

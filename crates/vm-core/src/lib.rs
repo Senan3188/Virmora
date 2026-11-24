@@ -22,7 +22,7 @@ pub enum VmState {
     Failed,
 }
 
-/// User-facing network modes. NAT and disconnected are implemented by the MVP.
+/// Virtual network attachment for the guest.
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkMode {
@@ -45,6 +45,14 @@ pub enum BootMode {
     Disk,
 }
 
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GuestOs {
+    #[default]
+    Linux,
+    Windows11,
+}
+
 /// Mutable machine settings. Storage identity and guest architecture are immutable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VmSettingsUpdate {
@@ -52,11 +60,18 @@ pub struct VmSettingsUpdate {
     pub cpus: u8,
     pub memory_mib: u64,
     pub network_mode: NetworkMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_interface: Option<String>,
     pub iso_path: Option<PathBuf>,
+    pub drivers_iso_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VmConfig {
+    #[serde(default)]
+    pub guest_os: GuestOs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drivers_iso_path: Option<PathBuf>,
     pub id: String,
     pub name: String,
     pub cpus: u8,
@@ -81,10 +96,14 @@ pub struct VmConfig {
     pub backend: BackendKind,
     #[serde(default)]
     pub network_mode: NetworkMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_interface: Option<String>,
 }
 impl VmConfig {
     pub fn direct_kernel_boot(&self) -> bool {
-        self.boot_mode == BootMode::Auto && !self.kernel_path.as_os_str().is_empty()
+        self.guest_os == GuestOs::Linux
+            && self.boot_mode == BootMode::Auto
+            && !self.kernel_path.as_os_str().is_empty()
     }
     pub fn installer_boot(&self) -> bool {
         self.boot_mode == BootMode::Installer
@@ -94,8 +113,45 @@ impl VmConfig {
     }
     pub fn validate(&self) -> Result<(), VmError> {
         validate_id(&self.id)?;
+        if self.network_mode == NetworkMode::Bridged {
+            let name = self.bridge_interface.as_deref().unwrap_or("en0");
+            if !valid_bridge_interface(name) {
+                return Err(VmError::InvalidConfig(
+                    "Select a physical bridge interface such as en0".into(),
+                ));
+            }
+        }
         if self.name.trim().is_empty() {
             return Err(VmError::InvalidConfig("name must not be empty".into()));
+        }
+        if self.guest_os == GuestOs::Windows11 {
+            if self.architecture != GuestArchitecture::Aarch64 || self.backend != BackendKind::Qemu
+            {
+                return Err(VmError::InvalidConfig(
+                    "Windows 11 currently requires the ARM64 QEMU profile".into(),
+                ));
+            }
+            if self.cpus < 2 || self.memory_mib < 4096 || self.disk_size_gib < 64 {
+                return Err(VmError::InvalidConfig(
+                    "Windows 11 requires at least 2 CPUs, 4096 MiB of RAM, and a 64 GiB disk"
+                        .into(),
+                ));
+            }
+            if self.cpus > 8 {
+                return Err(VmError::InvalidConfig(
+                    "The Windows 11 ARM64 profile supports up to 8 CPUs".into(),
+                ));
+            }
+            if !self.kernel_path.as_os_str().is_empty() || self.initrd_path.is_some() {
+                return Err(VmError::InvalidConfig("Windows 11 uses UEFI boot".into()));
+            }
+        }
+        if let Some(path) = &self.drivers_iso_path {
+            if self.guest_os != GuestOs::Windows11 || !valid_iso(path) {
+                return Err(VmError::InvalidConfig(
+                    "Driver media must be an existing absolute .iso file for a Windows VM".into(),
+                ));
+            }
         }
         if self.cpus == 0 || self.cpus > 64 {
             return Err(VmError::InvalidConfig("cpus must be 1..=64".into()));
@@ -128,12 +184,7 @@ impl VmConfig {
             let iso = self.iso_path.as_ref().ok_or_else(|| {
                 VmError::InvalidConfig("Installer boot requires an ISO image".into())
             })?;
-            if !iso.is_absolute()
-                || !iso.is_file()
-                || !iso
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"))
-            {
+            if !valid_iso(iso) {
                 return Err(VmError::InvalidConfig(
                     "ISO image must be an existing absolute .iso file path".into(),
                 ));
@@ -160,6 +211,29 @@ impl VmConfig {
         Ok(())
     }
 }
+fn valid_iso(path: &std::path::Path) -> bool {
+    path.is_absolute()
+        && path.is_file()
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"))
+}
+
+impl VmConfig {
+    /// Keep this file with the disk and UEFI variables when backing up a Windows VM.
+    pub fn tpm_state_path(&self) -> PathBuf {
+        let mut path = self.disk_path.as_os_str().to_os_string();
+        path.push(".tpm-state");
+        PathBuf::from(path)
+    }
+}
+
+pub fn valid_bridge_interface(name: &str) -> bool {
+    name.strip_prefix("en").is_some_and(|index| {
+        !index.is_empty() && index.len() <= 5 && index.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
 pub fn validate_id(id: &str) -> Result<(), VmError> {
     if id.is_empty()
         || id.len() > 64

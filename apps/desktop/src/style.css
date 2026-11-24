@@ -40,3 +40,6 @@
 .dialog-actions{justify-content:flex-end;margin-top:22px}
 .delete-disk-choice{flex-direction:row;align-items:center;font-size:13px}
 .delete-disk-choice input{width:auto;accent-color:#b9f879}
+
+.network-check { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.network-check [role="status"] { color: #a4b0c1; font-size: 12px; }
