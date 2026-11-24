@@ -58,10 +58,12 @@ async fn list_bridge_interfaces() -> Result<Vec<String>, String> {
 }
 #[tauri::command]
 async fn check_network(
+    state: State<'_, Desktop>,
     mode: vm_core::NetworkMode,
     adapter: String,
 ) -> Result<vm_qemu::vmnet::NetworkReadiness, String> {
-    tauri::async_runtime::spawn_blocking(move || vm_qemu::vmnet::readiness(mode, &adapter))
+    let backend = state.backend.clone();
+    tauri::async_runtime::spawn_blocking(move || backend.check_network(mode, &adapter))
         .await
         .map_err(|error| error.to_string())
 }
@@ -329,7 +331,19 @@ fn main() {
     fs::create_dir_all(&vm_directory).expect("cannot create virtual machine directory");
     fs::create_dir_all(&root).expect("cannot create Virmora data directory");
     let root = fs::canonicalize(root).expect("cannot resolve Virmora directory");
-    let backend = Arc::new(QemuBackend::new(root.join("run")));
+    let mut backend = QemuBackend::new(root.join("run"));
+    if let Some(contents) = std::env::current_exe().ok().and_then(|path| {
+        let executables = path.parent()?;
+        let contents = executables.parent()?;
+        (executables.file_name()? == "MacOS"
+            && contents.file_name()? == "Contents"
+            && contents.parent()?.extension()? == "app"
+            && contents.join("Resources/qemu").is_dir())
+        .then(|| contents.to_path_buf())
+    }) {
+        backend = backend.with_bundle_contents(contents);
+    }
+    let backend = Arc::new(backend);
     let manager = Arc::new(
         VmManager::new(&root, backend.clone())
             .expect("cannot open VM registry; close other Virmora processes"),

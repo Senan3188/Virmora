@@ -10,7 +10,12 @@ use vm_core::VmError;
 pub(crate) struct Tpm(Child);
 
 impl Tpm {
-    pub(crate) fn start(socket: &Path, state: &Path, log: &Path) -> Result<Self, VmError> {
+    pub(crate) fn start(
+        binary: &Path,
+        socket: &Path,
+        state: &Path,
+        log: &Path,
+    ) -> Result<Self, VmError> {
         let option_path = |path: &Path| {
             path.to_str()
                 .filter(|path| !path.contains(','))
@@ -53,7 +58,7 @@ impl Tpm {
         }
         let errors = OpenOptions::new().append(true).create(true).open(log)?;
         let mut tpm = Self(
-            Command::new("swtpm")
+            Command::new(binary)
                 .args([
                     "socket",
                     "--tpm2",

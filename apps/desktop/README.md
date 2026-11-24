@@ -8,7 +8,27 @@ npm ci
 npm run tauri dev
 ```
 
-`npm run build` checks TypeScript and builds the frontend; `cargo check --manifest-path src-tauri/Cargo.toml` checks the native application after the frontend has been built. `npm run tauri build -- --no-bundle` builds a local executable. Distribution signing and notarization are not configured.
+`npm run build` checks TypeScript and builds the frontend; `cargo check --manifest-path src-tauri/Cargo.toml` checks the native application after the frontend has been built. `npm run tauri build -- --no-bundle` builds a local executable.
+
+## Build a self-contained macOS DMG
+
+On the build Mac, install Python 3.9+, Rust, Node, Xcode command-line tools, and Homebrew. From the repository root, run:
+
+```sh
+brew install qemu swtpm socket_vmnet
+npm ci --prefix apps/desktop
+python3 scripts/package-macos.py
+```
+
+The script builds a native-architecture DMG under `apps/desktop/src-tauri/target/release/bundle/dmg`. It bundles both QEMU guest executables, their linked libraries, firmware, swtpm, and the optional network helpers. On Apple Silicon it also bundles the pinned Debian Windows ARM64 firmware. The oldest macOS version supported by the package depends on the build tools and Homebrew binaries used.
+
+Install the app by dragging it to Applications. Basic networking and VM creation use the bundled components. Users supply their own guest OS ISO. NAT Network, Bridged, and Host-only still require one-time administrator authorization. The installed bundle includes everything needed for that step:
+
+```sh
+bash "/Applications/Virmora.app/Contents/Resources/setup-macos-networking.sh" en0
+```
+
+The default build is ad hoc signed for local testing. For a direct-download release, set `APPLE_SIGNING_IDENTITY` to a Developer ID Application identity and `VIRMORA_NOTARY_PROFILE` to a notarytool Keychain profile. The script signs the nested runtime and app, then signs, notarizes, and staples the DMG. Keep signing credentials in Keychain. Before distributing a public build, include the complete corresponding source required by the bundled licenses, including relevant build scripts and patches. The bundle records component versions, packaged notices, and Homebrew formulas under `Contents/Resources/ThirdParty`.
 
 VM files default to `/Users/username/vermora/virtual machines` (using your actual macOS username). The UI displays the active location, including any `VIRMORA_HOME` override. The registry is shared with the CLI. Only one manager may own a registry at a time. Close a CLI `run` session before opening the same registry in the UI. Closing the app terminates owned QEMU processes.
 

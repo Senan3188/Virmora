@@ -63,7 +63,10 @@ fn boots_linux_and_preserves_disk_across_restart() {
         network_mode: vm_core::NetworkMode::Nat,
         bridge_interface: None,
     };
-    let backend = QemuBackend::new(root.join("runtime"));
+    let mut backend = QemuBackend::new(root.join("runtime"));
+    if let Some(contents) = std::env::var_os("VIRMORA_TEST_BUNDLE_CONTENTS") {
+        backend = backend.with_bundle_contents(PathBuf::from(contents));
+    }
     for _ in 0..2 {
         let log = backend.console_path("smoke").unwrap();
         let previous = fs::metadata(&log).map(|m| m.len()).unwrap_or(0);

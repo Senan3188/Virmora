@@ -38,7 +38,7 @@ fn client() -> Option<PathBuf> {
 }
 
 pub(crate) fn command(
-    binary: &str,
+    binary: &Path,
     mut args: Vec<OsString>,
     socket: Option<&Path>,
 ) -> Result<Command, VmError> {
@@ -67,6 +67,15 @@ pub(crate) fn command(
 
 /// Test the selected transport by opening it through the same QEMU launch path as a VM.
 pub fn readiness(mode: NetworkMode, adapter: &str) -> NetworkReadiness {
+    readiness_with_runtime(mode, adapter, |name| PathBuf::from(name), None)
+}
+
+pub(crate) fn readiness_with_runtime(
+    mode: NetworkMode,
+    adapter: &str,
+    executable: impl Fn(&str) -> PathBuf,
+    data: Option<&Path>,
+) -> NetworkReadiness {
     if !cfg!(target_os = "macos")
         && matches!(
             mode,
@@ -100,7 +109,7 @@ pub fn readiness(mode: NetworkMode, adapter: &str) -> NetworkReadiness {
     } else {
         ("qemu-system-x86_64", "q35")
     };
-    let args = [
+    let mut args: Vec<OsString> = [
         "-machine",
         machine,
         "-cpu",
@@ -125,13 +134,16 @@ pub fn readiness(mode: NetworkMode, adapter: &str) -> NetworkReadiness {
     .into_iter()
     .map(OsString::from)
     .collect();
+    if let Some(data) = data {
+        args.extend(["-L".into(), data.as_os_str().into()]);
+    }
     let result = (|| -> Result<(), VmError> {
         use std::{
             io::Write,
             thread,
             time::{Duration, Instant},
         };
-        let mut child = command(qemu, args, Some(&socket))?
+        let mut child = command(&executable(qemu), args, Some(&socket))?
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

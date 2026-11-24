@@ -14,13 +14,20 @@ Virmora is a macOS VM manager with a Rust backend and a Tauri 2 / React desktop 
 - Read existing VM configurations when adding fields. Use compatible defaults where appropriate.
 - Keep configuration edits and deletion restricted to stopped machines. Keep graceful shutdown and force stop distinct, and keep disk retention selected by default.
 - Treat the disk, UEFI variables, and Windows TPM state as persistent VM data. Keep the Windows installer and installed-disk modes on the same virtual hardware. Use a fresh temporary VM for destructive or boot tests.
-- Keep VM disks, firmware binaries, installer and driver ISOs, runtime state, logs, and credentials out of Git.
+- Keep VM disks, firmware binaries, installer and driver ISOs, runtime state, logs, generated DMGs, and signing credentials out of Git.
 - Show unavailable metrics as unavailable. Label host measurements separately from guest measurements.
 - Describe networking and guest support based on what the backend actually implements and what has been tested.
+
+## macOS packaging
+
+- Build the native-architecture DMG with `scripts/package-macos.py`. Packaged apps resolve QEMU, swtpm, libraries, and firmware inside the app bundle. Source builds and the CLI use the host runtime.
+- Keep administrator authorization explicit for NAT Network, Bridged, and Host-only. Keep the bundled network helpers linked only against macOS system libraries.
+- Use ad hoc signing for local tests. For a public DMG, use Developer ID signing, notarize and staple the image, and provide corresponding source required by the bundled licenses. See `apps/desktop/README.md`.
 
 ## Verification
 
 - Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked` for Rust changes.
 - For desktop changes, run `npm ci --prefix apps/desktop`, `npm run build --prefix apps/desktop`, and `cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml`.
 - For host setup scripts, run `bash -n` and document dependencies, installation locations, and any required administrator access.
+- For DMG changes, verify the image and app signature, then test from a copy of the app with host QEMU and firmware unavailable. Record the architecture and minimum macOS version that the package supports.
 - See `docs/validation.md` and `docs/monitoring.md` for opt-in tests that need QEMU, local guest assets, or macOS process and socket access.

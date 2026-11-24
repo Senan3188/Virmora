@@ -12,14 +12,15 @@ if [[ ! "$bridge" =~ ^en[0-9]{1,5}$ ]] || ! /sbin/ifconfig "$bridge" >/dev/null 
     exit 1
 fi
 
-prefix=""
-for candidate in /opt/homebrew/opt/socket_vmnet /usr/local/opt/socket_vmnet; do
-    if [[ -x "$candidate/bin/socket_vmnet" && -x "$candidate/bin/socket_vmnet_client" ]]; then
-        prefix="$candidate"
+script_directory="$(cd -- "$(/usr/bin/dirname -- "$0")" && pwd -P)"
+bin=""
+for candidate in "$script_directory/../MacOS" /opt/homebrew/opt/socket_vmnet/bin /usr/local/opt/socket_vmnet/bin; do
+    if [[ -x "$candidate/socket_vmnet" && -x "$candidate/socket_vmnet_client" ]]; then
+        bin="$candidate"
         break
     fi
 done
-if [[ -z "$prefix" ]]; then
+if [[ -z "$bin" ]]; then
     echo "Install the socket_vmnet package first: brew install socket_vmnet" >&2
     exit 1
 fi
@@ -42,8 +43,8 @@ sudo /usr/bin/install -d -o root -g wheel -m 0755 "$base"
 sudo /usr/bin/install -d -o root -g wheel -m 0700 "$base/sockets"
 sudo /bin/chmod -N "$base/sockets"
 sudo /bin/chmod +a "user:$account allow search" "$base/sockets"
-sudo /usr/bin/install -o root -g wheel -m 0755 "$prefix/bin/socket_vmnet" "$base/socket_vmnet"
-sudo /usr/bin/install -o root -g wheel -m 0755 "$prefix/bin/socket_vmnet_client" "$base/socket_vmnet_client"
+sudo /usr/bin/install -o root -g wheel -m 0755 "$bin/socket_vmnet" "$base/socket_vmnet"
+sudo /usr/bin/install -o root -g wheel -m 0755 "$bin/socket_vmnet_client" "$base/socket_vmnet_client"
 
 install_service() {
     local mode="$1" suffix="$2" argument="$3"

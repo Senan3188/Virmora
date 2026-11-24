@@ -66,6 +66,8 @@ NAT Network, Bridged, and Host-only can use the macOS socket_vmnet services or a
 
 See `apps/desktop/README.md` for desktop controls and packaging. Tauri dependencies are isolated in their own Cargo workspace. The desktop and CLI use the same VM types and manager; use one at a time for a data directory.
 
+Build a [self-contained macOS DMG](apps/desktop/README.md#build-a-self-contained-macos-dmg) to install Virmora and its VM runtime together. The commands below install dependencies individually when running Virmora from source.
+
 ## Windows 11 ARM64 preview
 
 With QEMU installed, prepare the Apple Silicon host from the repository root:

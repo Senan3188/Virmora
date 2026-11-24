@@ -30,6 +30,7 @@ struct Instance {
 
 pub struct QemuBackend {
     runtime_dir: PathBuf,
+    bundle_contents: Option<PathBuf>,
     instances: Mutex<HashMap<String, Instance>>,
     display: bool,
     internal_socket: PathBuf,
@@ -46,12 +47,40 @@ impl QemuBackend {
             .join("lan.sock");
         Self {
             runtime_dir,
+            bundle_contents: None,
             internal_socket,
             #[cfg(unix)]
             internal_network: Mutex::new(None),
             instances: Mutex::new(HashMap::new()),
             display: cfg!(target_os = "macos"),
         }
+    }
+    /// Use the runtime shipped inside a macOS app bundle.
+    pub fn with_bundle_contents(mut self, contents: PathBuf) -> Self {
+        self.bundle_contents = Some(contents);
+        self
+    }
+
+    fn runtime_binary(&self, name: &str) -> PathBuf {
+        match &self.bundle_contents {
+            Some(contents) => contents.join("MacOS").join(name),
+            None => PathBuf::from(name),
+        }
+    }
+
+    fn bundled_data(&self) -> Option<PathBuf> {
+        self.bundle_contents
+            .as_ref()
+            .map(|contents| contents.join("Resources/qemu"))
+    }
+
+    pub fn check_network(&self, mode: NetworkMode, adapter: &str) -> vmnet::NetworkReadiness {
+        vmnet::readiness_with_runtime(
+            mode,
+            adapter,
+            |name| self.runtime_binary(name),
+            self.bundled_data().as_deref(),
+        )
     }
     /// Enable the native QEMU Cocoa display for firmware boots (macOS only).
     pub fn with_display(runtime_dir: PathBuf, enabled: bool) -> Self {
@@ -64,11 +93,13 @@ impl QemuBackend {
         path.push(".nvram.fd");
         PathBuf::from(path)
     }
-    fn firmware_paths(config: &VmConfig) -> Result<(PathBuf, PathBuf), VmError> {
+    fn firmware_paths(&self, config: &VmConfig) -> Result<(PathBuf, PathBuf), VmError> {
         if config.guest_os == GuestOs::Windows11 {
-            let default_folder = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join("Library/Application Support/Virmora/Firmware"));
+            let default_folder = self.bundled_data().or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join("Library/Application Support/Virmora/Firmware"))
+            });
             let resolve = |path: &Option<PathBuf>, filename: &str| {
                 path.clone().or_else(|| default_folder.as_ref().map(|folder| folder.join(filename)))
                     .filter(|path| path.is_file())
@@ -86,6 +117,17 @@ impl QemuBackend {
             GuestArchitecture::X86_64 => ("edk2-x86_64-code.fd", "edk2-i386-vars.fd"),
         };
         let discover = |name: &str| -> Result<PathBuf, VmError> {
+            if let Some(folder) = self.bundled_data() {
+                let path = folder.join(name);
+                return if path.is_file() {
+                    Ok(path)
+                } else {
+                    Err(VmError::Backend(format!(
+                        "Bundled UEFI firmware is missing: {}",
+                        path.display()
+                    )))
+                };
+            }
             ["/opt/homebrew/share/qemu", "/usr/local/share/qemu", "/usr/share/qemu"].iter()
                 .map(|root| Path::new(root).join(name)).find(|p| p.is_file())
                 .ok_or_else(|| VmError::Backend(format!("UEFI firmware {name} was not found; install QEMU or configure explicit firmware paths")))
@@ -100,8 +142,8 @@ impl QemuBackend {
         };
         Ok((code, vars))
     }
-    fn prepare_nvram(config: &VmConfig) -> Result<(), VmError> {
-        let (_, template) = Self::firmware_paths(config)?;
+    fn prepare_nvram(&self, config: &VmConfig) -> Result<(), VmError> {
+        let (_, template) = self.firmware_paths(config)?;
         let path = Self::nvram_path(config);
         match fs::OpenOptions::new()
             .write(true)
@@ -311,6 +353,9 @@ impl QemuBackend {
             "-monitor".into(),
             "none".into(),
         ];
+        if let Some(data) = self.bundled_data() {
+            args.extend(["-L".into(), data.into_os_string()]);
+        }
         if config.direct_kernel_boot() {
             args.extend([
                 "-kernel".into(),
@@ -336,7 +381,7 @@ impl QemuBackend {
                 // to the explicitly configured virtio GPU.
                 args.extend(["-vga".into(), "none".into()]);
             }
-            let (code, _) = Self::firmware_paths(config)?;
+            let (code, _) = self.firmware_paths(config)?;
             args.extend([
                 "-drive".into(),
                 format!(
@@ -485,7 +530,7 @@ impl VmBackend for QemuBackend {
             ));
         }
         if !config.direct_kernel_boot() {
-            Self::prepare_nvram(config)?;
+            self.prepare_nvram(config)?;
         }
         for path in std::iter::once(&config.disk_path) {
             if !path.is_file() {
@@ -540,6 +585,7 @@ impl VmBackend for QemuBackend {
         );
         let tpm = if config.guest_os == GuestOs::Windows11 {
             Some(tpm::Tpm::start(
+                &self.runtime_binary("swtpm"),
                 &dir.join("tpm.sock"),
                 &config.tpm_state_path(),
                 &dir.join("qemu.log"),
@@ -547,14 +593,16 @@ impl VmBackend for QemuBackend {
         } else {
             None
         };
-        let child = vmnet::command(&binary, args, socket.as_deref())?
+        let executable = self.runtime_binary(&binary);
+        let child = vmnet::command(&executable, args, socket.as_deref())?
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(errors)
             .spawn()
-            .map_err(|e| {
+            .map_err(|error| {
                 VmError::Backend(format!(
-                    "Could not launch QEMU: {e}. Install QEMU and ensure it is on PATH"
+                    "Could not launch {}: {error}",
+                    executable.display()
                 ))
             })?;
         instances.insert(
@@ -901,6 +949,36 @@ mod tests {
         )));
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn bundled_runtime_resolves_firmware_and_executables_inside_the_bundle() {
+        let (mut cfg, root) = firmware_config();
+        let contents = root.join("Virmora Test.app/Contents");
+        let data = contents.join("Resources/qemu");
+        fs::create_dir_all(&data).unwrap();
+        cfg.firmware_code_path = None;
+        cfg.firmware_vars_template_path = None;
+        let code = data.join("edk2-aarch64-code.fd");
+        let vars = data.join("edk2-arm-vars.fd");
+        fs::write(&code, b"firmware").unwrap();
+        fs::write(&vars, b"variables").unwrap();
+        let backend =
+            QemuBackend::new("/tmp/virmora".into()).with_bundle_contents(contents.clone());
+        assert_eq!(backend.firmware_paths(&cfg).unwrap(), (code, vars));
+        let (binary, args) = backend.command_arguments(&cfg).unwrap();
+        assert_eq!(
+            backend.runtime_binary(&binary),
+            contents.join("MacOS").join(binary)
+        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "-L" && pair[1] == data.as_os_str()));
+        assert_eq!(
+            backend.runtime_binary("swtpm"),
+            contents.join("MacOS/swtpm")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn windows_installer_and_disk_boot_use_the_same_guest_hardware() {
@@ -950,11 +1028,12 @@ mod tests {
     #[test]
     fn nvram_is_initialized_once_and_preserved_on_restart() {
         let (cfg, root) = firmware_config();
-        QemuBackend::prepare_nvram(&cfg).unwrap();
+        let backend = QemuBackend::new(root.join("run"));
+        backend.prepare_nvram(&cfg).unwrap();
         let nvram = QemuBackend::nvram_path(&cfg);
         assert_eq!(fs::read(&nvram).unwrap(), b"initial variables");
         fs::write(&nvram, b"guest variables!!").unwrap();
-        QemuBackend::prepare_nvram(&cfg).unwrap();
+        backend.prepare_nvram(&cfg).unwrap();
         assert_eq!(fs::read(&nvram).unwrap(), b"guest variables!!");
         assert_ne!(nvram, cfg.disk_path);
         fs::remove_dir_all(root).unwrap();
@@ -962,16 +1041,17 @@ mod tests {
     #[test]
     fn corrupt_nvram_is_rejected_without_replacing_it() {
         let (cfg, root) = firmware_config();
+        let backend = QemuBackend::new(root.join("run"));
         let nvram = QemuBackend::nvram_path(&cfg);
         fs::write(&nvram, b"truncated").unwrap();
-        assert!(QemuBackend::prepare_nvram(&cfg).is_err());
+        assert!(backend.prepare_nvram(&cfg).is_err());
         assert_eq!(fs::read(&nvram).unwrap(), b"truncated");
         #[cfg(unix)]
         {
             fs::remove_file(&nvram).unwrap();
             std::os::unix::fs::symlink(cfg.firmware_vars_template_path.as_ref().unwrap(), &nvram)
                 .unwrap();
-            assert!(QemuBackend::prepare_nvram(&cfg).is_err());
+            assert!(backend.prepare_nvram(&cfg).is_err());
             assert!(fs::symlink_metadata(&nvram)
                 .unwrap()
                 .file_type()
