@@ -12,6 +12,8 @@ use std::{
 };
 pub mod metrics;
 mod tpm;
+#[cfg(unix)]
+mod traffic;
 pub mod vmnet;
 pub use metrics::VmMetrics;
 use vm_core::{
@@ -346,7 +348,7 @@ impl QemuBackend {
             config.memory_mib.to_string().into(),
             "-display".into(),
             if !config.direct_kernel_boot() && self.display && cfg!(target_os = "macos") {
-                "cocoa".into()
+                "cocoa,zoom-to-fit=on".into()
             } else {
                 "none".into()
             },
@@ -523,7 +525,7 @@ impl VmBackend for QemuBackend {
                 "QEMU backend requires backend=qemu".into(),
             ));
         }
-        let (binary, args) = self.command_arguments(config)?;
+        let (binary, mut args) = self.command_arguments(config)?;
         if config.cpus == 0 || config.memory_mib < 128 {
             return Err(VmError::InvalidConfig(
                 "At least one CPU and 128 MiB RAM are required".into(),
@@ -593,6 +595,8 @@ impl VmBackend for QemuBackend {
         } else {
             None
         };
+        let mut monitor = metrics::Monitor::new(config.network_mode);
+        monitor.attach_network(&dir, &mut args);
         let executable = self.runtime_binary(&binary);
         let child = vmnet::command(&executable, args, socket.as_deref())?
             .stdin(Stdio::null())
@@ -633,10 +637,7 @@ impl VmBackend for QemuBackend {
                 )));
             }
             if qmp_ready(&dir.join("qmp.sock")) {
-                instance.monitor = Some(metrics::Monitor::new(
-                    instance.child.id(),
-                    config.network_mode,
-                ));
+                instance.monitor = Some(monitor);
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -1175,7 +1176,7 @@ mod tests {
             std::process::id()
         )));
         let child = Command::new("sleep").arg("30").spawn().unwrap();
-        let monitor = metrics::Monitor::new(child.id(), NetworkMode::Disconnected);
+        let monitor = metrics::Monitor::new(NetworkMode::Disconnected);
         backend.instances.lock().unwrap().insert(
             "guest".into(),
             Instance {

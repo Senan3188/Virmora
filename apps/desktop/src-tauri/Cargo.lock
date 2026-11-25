@@ -4007,6 +4007,7 @@ dependencies = [
 name = "vm-qemu"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "vm-core",

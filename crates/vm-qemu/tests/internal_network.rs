@@ -90,6 +90,8 @@ fn two_guests_exchange_traffic_on_internal_network() {
         wait_for(&log, "LAN_READY");
         guests.push((console, log));
     }
+    let before = backend.metrics("first").unwrap();
+    assert!(before.network_available);
     let (console, log) = &mut guests[0];
     writeln!(
         console,
@@ -97,6 +99,14 @@ fn two_guests_exchange_traffic_on_internal_network() {
     )
     .unwrap();
     wait_for(log, "PEER_REACHED");
+    let first = backend.metrics("first").unwrap();
+    let second = backend.metrics("second").unwrap();
+    assert!(first.network_rx_bytes > before.network_rx_bytes);
+    assert!(first.network_tx_bytes > before.network_tx_bytes);
+    assert!(first.network_rx_bytes_per_sec.unwrap() > 0.);
+    assert!(first.network_tx_bytes_per_sec.unwrap() > 0.);
+    assert!(second.network_rx_bytes.unwrap() > 0);
+    assert!(second.network_tx_bytes.unwrap() > 0);
     backend.force_stop("first").unwrap();
     backend.force_stop("second").unwrap();
 }

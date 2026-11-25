@@ -43,3 +43,16 @@
 
 .network-check { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .network-check [role="status"] { color: #a4b0c1; font-size: 12px; }
+
+.form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+.form-grid select,.form-grid input{height:40px}
+.hardware-number{display:flex;flex-direction:column;gap:9px;min-width:0}
+.number-control{display:grid;grid-template-columns:40px minmax(0,1fr) 40px}
+.number-control input{appearance:textfield;-moz-appearance:textfield;border-radius:0;text-align:center;font-variant-numeric:tabular-nums;min-width:0;padding-inline:5px}
+.number-control input::-webkit-inner-spin-button,.number-control input::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+.number-control input:focus-visible{position:relative;z-index:1}
+.number-control button{background:#1f2632;color:#d0dae7;border:1px solid #303b4c;font-size:17px}
+.number-control button:first-child{border-right:0;border-radius:5px 0 0 5px}
+.number-control button:last-child{border-left:0;border-radius:0 5px 5px 0}
+.number-control button:hover:enabled{background:#2b3646}
+.number-control button:focus-visible{outline:1px solid #9ac569;outline-offset:-2px}

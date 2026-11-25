@@ -1,23 +1,15 @@
-//! Per-process measurements. Network counts are observed host NAT socket bytes,
-//! not guest Ethernet traffic, and can exclude sockets closed between samples.
+//! Host CPU and memory measurements, plus byte counts at the guest Ethernet device.
 use serde::Serialize;
-#[cfg(any(target_os = "macos", test))]
-use std::process::Command;
-#[cfg(target_os = "macos")]
 use std::{
-    io::{BufRead, BufReader},
-    process::Stdio,
-    thread,
-};
-use std::{
-    process::Child,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
-    thread::JoinHandle,
+    ffi::OsString,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
+use vm_core::NetworkMode;
+
+#[cfg(unix)]
+use crate::traffic::Traffic;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VmMetrics {
@@ -69,120 +61,61 @@ fn memory_note() -> &'static str {
         "QEMU process memory measurement unavailable on this host"
     }
 }
-#[cfg(any(target_os = "macos", test))]
-const NETWORK_NOTE: &str = "Observed QEMU host TCP/UDP socket traffic (NAT); excludes guest link/DHCP traffic and may omit short-lived sockets";
 static GENERATION: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Default)]
-struct NetworkSample {
-    available: bool,
-    rx: u64,
-    tx: u64,
-    rx_rate: Option<f64>,
-    tx_rate: Option<f64>,
-    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
-    previous: Option<Instant>,
-    note: Option<String>,
-}
-impl NetworkSample {
-    #[cfg(any(target_os = "macos", test))]
-    fn add(&mut self, rx: u64, tx: u64, now: Instant) {
-        let elapsed = self
-            .previous
-            .map(|p| now.saturating_duration_since(p).as_secs_f64());
-        self.rx_rate = elapsed.filter(|s| *s > 0.).map(|s| rx as f64 / s);
-        self.tx_rate = elapsed.filter(|s| *s > 0.).map(|s| tx as f64 / s);
-        self.rx = self.rx.saturating_add(rx);
-        self.tx = self.tx.saturating_add(tx);
-        self.previous = Some(now);
-        self.available = true;
-        self.note = Some(NETWORK_NOTE.into());
-    }
-}
 
 pub(crate) struct Monitor {
     pub generation: u64,
     previous_cpu: Option<(Instant, u64)>,
-    network: Arc<Mutex<NetworkSample>>,
-    collector: Option<Child>,
-    reader: Option<JoinHandle<()>>,
+    previous_network: Option<(Instant, u64, u64)>,
+    mode: NetworkMode,
+    network_note: &'static str,
+    #[cfg(unix)]
+    traffic: Option<Traffic>,
 }
+
 impl Monitor {
-    pub fn new(pid: u32, mode: vm_core::NetworkMode) -> Self {
-        let network = Arc::new(Mutex::new(NetworkSample {
-            note: Some("Waiting for per-process network samples".into()),
-            ..Default::default()
-        }));
-        let mut monitor = Self {
+    pub fn new(mode: NetworkMode) -> Self {
+        Self {
             generation: GENERATION.fetch_add(1, Ordering::Relaxed),
             previous_cpu: None,
-            network,
-            collector: None,
-            reader: None,
-        };
-        if mode == vm_core::NetworkMode::Disconnected {
-            *monitor.network.lock().unwrap() = NetworkSample {
-                available: true,
-                rx_rate: Some(0.),
-                tx_rate: Some(0.),
-                note: Some("VM network is disconnected".into()),
-                ..Default::default()
-            };
-        } else if mode == vm_core::NetworkMode::Nat {
-            monitor.start_network(pid);
-        } else {
-            monitor.network.lock().unwrap().note =
-                Some("Traffic counters are unavailable for this network mode.".into());
-        }
-        monitor
-    }
-    #[cfg(target_os = "macos")]
-    fn start_network(&mut self, pid: u32) {
-        let child = spawn_nettop(pid);
-        match child {
-            Ok((child, output)) => {
-                let network = self.network.clone();
-                self.reader = Some(thread::spawn(move || {
-                    let mut parser = NetworkCsv::default();
-                    for line in BufReader::new(output).lines() {
-                        let Ok(line) = line else { break };
-                        if let Some((rx, tx, at)) = parser.ingest(&line, pid, Instant::now()) {
-                            if let Ok(mut sample) = network.lock() {
-                                sample.add(rx, tx, at);
-                            }
-                        }
-                    }
-                    if let Ok(mut sample) = network.lock() {
-                        sample.available = false;
-                        sample.rx_rate = None;
-                        sample.tx_rate = None;
-                        sample.note=Some("Per-process network collector unavailable or exited (nettop permissions may be required)".into());
-                    }
-                }));
-                self.collector = Some(child);
-            }
-            Err(error) => {
-                self.network.lock().unwrap().note = Some(format!(
-                    "Per-process network collector unavailable: {error}"
-                ));
-            }
+            previous_network: None,
+            mode,
+            network_note: "Virtual NIC counters are unavailable",
+            #[cfg(unix)]
+            traffic: None,
         }
     }
-    #[cfg(not(target_os = "macos"))]
-    fn start_network(&mut self, _: u32) {
-        self.network.lock().unwrap().note =
-            Some("Per-process NAT network monitoring requires macOS nettop".into());
+
+    pub fn attach_network(&mut self, runtime: &Path, args: &mut Vec<OsString>) {
+        #[cfg(unix)]
+        if self.mode != NetworkMode::Disconnected {
+            match Traffic::start(runtime)
+                .map_err(vm_core::VmError::from)
+                .and_then(|traffic| Ok((traffic.arguments()?, traffic)))
+            {
+                Ok((network_args, traffic)) => {
+                    args.extend(network_args);
+                    self.traffic = Some(traffic);
+                    self.network_note = "Waiting for virtual NIC counters";
+                }
+                Err(_) => self.network_note = "Could not initialize virtual NIC counters",
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (runtime, args);
     }
+
+    fn network_totals(&self) -> Option<(u64, u64)> {
+        if self.mode == NetworkMode::Disconnected {
+            return Some((0, 0));
+        }
+        #[cfg(unix)]
+        return self.traffic.as_ref()?.totals();
+        #[cfg(not(unix))]
+        None
+    }
+
     pub fn sample(&mut self, pid: u32) -> VmMetrics {
-        // Reap collectors that fail early (for example permission denial),
-        // without waiting until the VM is eventually stopped.
-        if self
-            .collector
-            .as_mut()
-            .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
-        {
-            self.collector = None;
-        }
         let now = Instant::now();
         let mut result = VmMetrics::stopped(self.generation);
         result.running = true;
@@ -198,37 +131,37 @@ impl Monitor {
             });
             self.previous_cpu = Some((now, cpu));
         }
-        if let Ok(sample) = self.network.lock() {
-            let stale = sample.previous.is_some_and(|at| {
-                now.saturating_duration_since(at) > std::time::Duration::from_secs(5)
-            });
-            result.network_available = sample.available && !stale;
-            result.network_note = if stale {
-                Some("Per-process network samples are stale; collector may be unavailable".into())
+        result.network_note = Some(self.network_note.into());
+        if let Some((rx, tx)) = self.network_totals() {
+            result.network_available = true;
+            result.network_rx_bytes = Some(rx);
+            result.network_tx_bytes = Some(tx);
+            if self.mode == NetworkMode::Disconnected {
+                result.network_note = Some("VM network is disconnected".into());
+                result.network_rx_bytes_per_sec = Some(0.);
+                result.network_tx_bytes_per_sec = Some(0.);
             } else {
-                sample.note.clone()
-            };
-            if result.network_available {
-                result.network_rx_bytes = Some(sample.rx);
-                result.network_tx_bytes = Some(sample.tx);
-                result.network_rx_bytes_per_sec = sample.rx_rate;
-                result.network_tx_bytes_per_sec = sample.tx_rate;
+                result.network_note = None;
+                if let Some((previous, previous_rx, previous_tx)) = self.previous_network {
+                    let elapsed = now.saturating_duration_since(previous).as_secs_f64();
+                    if elapsed > 0. {
+                        result.network_rx_bytes_per_sec = rx
+                            .checked_sub(previous_rx)
+                            .map(|bytes| bytes as f64 / elapsed);
+                        result.network_tx_bytes_per_sec = tx
+                            .checked_sub(previous_tx)
+                            .map(|bytes| bytes as f64 / elapsed);
+                    }
+                }
+                self.previous_network = Some((now, rx, tx));
             }
+        } else {
+            self.previous_network = None;
         }
         result
     }
 }
-impl Drop for Monitor {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.collector.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
-    }
-}
+
 fn cpu_delta(previous: u64, current: u64, elapsed: f64) -> Option<f64> {
     if elapsed <= 0. || !elapsed.is_finite() {
         return None;
@@ -287,284 +220,30 @@ fn mach_ticks_to_ns(ticks: u64) -> Option<u64> {
     }))?;
     Some(((ticks as u128 * numer as u128) / denom as u128).min(u64::MAX as u128) as u64)
 }
-#[cfg(target_os = "macos")]
-fn spawn_nettop(pid: u32) -> std::io::Result<(Child, std::fs::File)> {
-    use std::os::fd::FromRawFd;
-    unsafe extern "C" {
-        fn fcntl(fd: i32, command: i32, ...) -> i32;
-        fn openpty(
-            master: *mut i32,
-            slave: *mut i32,
-            name: *mut std::ffi::c_char,
-            term: *const std::ffi::c_void,
-            window: *const std::ffi::c_void,
-        ) -> i32;
-    }
-    let mut master = -1;
-    let mut slave = -1;
-    // A PTY makes nettop line-buffer stdout. A pipe otherwise retains samples
-    // in stdio buffers for minutes, so live network graphs never update.
-    let status = unsafe {
-        openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    if status != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let output = unsafe { std::fs::File::from_raw_fd(master) };
-    let slave = unsafe { std::fs::File::from_raw_fd(slave) };
-    use std::os::fd::AsRawFd;
-    // Prevent other VM/collector spawns from inheriting either PTY endpoint.
-    // Child stdout is duped by Command and remains open after exec.
-    for fd in [output.as_raw_fd(), slave.as_raw_fd()] {
-        if unsafe { fcntl(fd, 2, 1) } < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    let child = Command::new("/usr/bin/nettop")
-        .args([
-            "-P",
-            "-L",
-            "0",
-            "-n",
-            "-x",
-            "-d",
-            "-s",
-            "1",
-            "-J",
-            "bytes_in,bytes_out",
-            "-p",
-            &pid.to_string(),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(slave))
-        .stderr(Stdio::null())
-        .spawn()?;
-    Ok((child, output))
-}
 #[cfg(not(target_os = "macos"))]
 fn process_sample(_: u32) -> Option<(u64, u64)> {
     None
 }
 
-/// Publish exactly once per complete CSV interval, including intervals in
-/// which the target process has no sockets. Row parsing never changes the clock.
-#[cfg(any(target_os = "macos", test))]
-#[derive(Default)]
-struct NetworkCsv {
-    columns: Option<(usize, usize)>,
-    at: Option<Instant>,
-    pending: (u64, u64),
-    valid: bool,
-}
-#[cfg(any(target_os = "macos", test))]
-impl NetworkCsv {
-    fn ingest(&mut self, line: &str, pid: u32, now: Instant) -> Option<(u64, u64, Instant)> {
-        let values = csv_fields(line);
-        if let (Some(rx), Some(tx)) = (
-            values.iter().position(|v| v == "bytes_in"),
-            values.iter().position(|v| v == "bytes_out"),
-        ) {
-            let complete = self
-                .at
-                .filter(|_| self.valid)
-                .map(|at| (self.pending.0, self.pending.1, at));
-            self.columns = Some((rx, tx));
-            self.at = Some(now);
-            self.pending = (0, 0);
-            self.valid = true;
-            return complete;
-        }
-        if let Some((rx, tx)) = self.columns {
-            if let Some((rx, tx)) = parse_process_row(&values, pid, rx, tx) {
-                self.pending = (rx, tx);
-            } else if values
-                .first()
-                .and_then(|v| v.rsplit_once('.'))
-                .and_then(|(_, v)| v.parse::<u32>().ok())
-                == Some(pid)
-            {
-                self.valid = false;
-            }
-        }
-        None
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn csv_fields(line: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut value = String::new();
-    let mut quoted = false;
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' if quoted && chars.peek() == Some(&'"') => {
-                value.push('"');
-                chars.next();
-            }
-            '"' => quoted = !quoted,
-            ',' if !quoted => {
-                fields.push(std::mem::take(&mut value));
-            }
-            _ => value.push(c),
-        }
-    }
-    fields.push(value);
-    fields
-}
-#[cfg(any(target_os = "macos", test))]
-fn parse_process_row(values: &[String], pid: u32, rx: usize, tx: usize) -> Option<(u64, u64)> {
-    let (_, row_pid) = values.first()?.rsplit_once('.')?;
-    if row_pid.parse::<u32>().ok()? != pid {
-        return None;
-    }
-    Some((values.get(rx)?.parse().ok()?, values.get(tx)?.parse().ok()?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn cpu_interval_supports_multicore_and_resets() {
         assert_eq!(cpu_delta(1_000_000_000, 5_000_000_000, 2.), Some(200.));
         assert_eq!(cpu_delta(9, 1, 1.), None);
         assert_eq!(cpu_delta(0, 1, 0.), None);
     }
-    #[test]
-    fn csv_matches_exact_pid_and_reordered_columns() {
-        let row = csv_fields("\"qemu, ARM.123\",42,99,");
-        assert_eq!(parse_process_row(&row, 123, 2, 1), Some((99, 42)));
-        assert_eq!(parse_process_row(&row, 12, 2, 1), None);
-        assert_eq!(
-            parse_process_row(&csv_fields("qemu.123,?,0"), 123, 1, 2),
-            None
-        );
-    }
-    #[test]
-    fn network_deltas_accumulate_and_compute_interval_rates() {
-        let now = Instant::now();
-        let mut state = NetworkSample::default();
-        state.add(100, 50, now);
-        assert_eq!(state.rx_rate, None);
-        state.add(200, 80, now + std::time::Duration::from_secs(2));
-        assert_eq!(state.rx, 300);
-        assert_eq!(state.tx, 130);
-        assert_eq!(state.rx_rate, Some(100.));
-        assert_eq!(state.tx_rate, Some(40.));
-    }
-    #[test]
-    fn no_socket_to_traffic_transition_uses_full_interval() {
-        let at = Instant::now();
-        let mut parser = NetworkCsv::default();
-        let mut sample = NetworkSample::default();
-        assert!(parser.ingest(",bytes_in,bytes_out,", 123, at).is_none());
-        let (rx, tx, time) = parser
-            .ingest(
-                ",bytes_in,bytes_out,",
-                123,
-                at + std::time::Duration::from_secs(1),
-            )
-            .unwrap();
-        sample.add(rx, tx, time);
-        assert!(parser
-            .ingest(
-                "qemu.123,200,100,",
-                123,
-                at + std::time::Duration::from_millis(1001)
-            )
-            .is_none());
-        let (rx, tx, time) = parser
-            .ingest(
-                ",bytes_in,bytes_out,",
-                123,
-                at + std::time::Duration::from_secs(2),
-            )
-            .unwrap();
-        sample.add(rx, tx, time);
-        assert_eq!(sample.rx_rate, Some(200.));
-        assert_eq!(sample.tx_rate, Some(100.));
-    }
+
     #[test]
     fn disconnected_is_actual_zero_and_generations_reset() {
-        let mut first = Monitor::new(std::process::id(), vm_core::NetworkMode::Disconnected);
+        let mut first = Monitor::new(NetworkMode::Disconnected);
         let sample = first.sample(std::process::id());
         assert!(sample.network_available);
         assert_eq!(sample.network_rx_bytes, Some(0));
-        let second = Monitor::new(std::process::id(), vm_core::NetworkMode::Disconnected);
+        assert_eq!(sample.network_tx_bytes_per_sec, Some(0.));
+        let second = Monitor::new(NetworkMode::Disconnected);
         assert_ne!(first.generation, second.generation);
-        assert_eq!(second.network.lock().unwrap().rx, 0);
-    }
-    #[test]
-    fn stale_collector_samples_are_unavailable_but_disconnected_stays_zero() {
-        let mut monitor = Monitor::new(std::process::id(), vm_core::NetworkMode::Disconnected);
-        {
-            let mut network = monitor.network.lock().unwrap();
-            network.add(100, 10, Instant::now() - std::time::Duration::from_secs(6));
-        }
-        let sample = monitor.sample(std::process::id());
-        assert!(!sample.network_available);
-        assert_eq!(sample.network_rx_bytes, None);
-        assert_eq!(sample.network_rx_bytes_per_sec, None);
-        let mut disconnected = Monitor::new(std::process::id(), vm_core::NetworkMode::Disconnected);
-        assert_eq!(
-            disconnected.sample(std::process::id()).network_rx_bytes,
-            Some(0)
-        );
-    }
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "requires macOS process inspection, PTYs and loopback networking outside the sandbox"]
-    fn live_macos_process_cpu_and_network_stream() {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let address = socket.local_addr().unwrap();
-        let mut monitor = Monitor::new(std::process::id(), vm_core::NetworkMode::Nat);
-        monitor.sample(std::process::id());
-        let worker = std::thread::spawn(move || {
-            let deadline = Instant::now() + std::time::Duration::from_secs(4);
-            let mut buffer = [0u8; 512];
-            while Instant::now() < deadline {
-                socket.send_to(&buffer, address).unwrap();
-                socket.recv_from(&mut buffer).unwrap();
-                for n in 0..10000 {
-                    std::hint::black_box(n * n);
-                }
-            }
-        });
-        std::thread::sleep(std::time::Duration::from_secs(4));
-        let sample = monitor.sample(std::process::id());
-        worker.join().unwrap();
-        assert!(sample.cpu_percent.unwrap_or_default() > 20., "{sample:?}");
-        assert!(sample.memory_bytes.unwrap_or_default() > 0, "{sample:?}");
-        assert!(sample.network_available, "{sample:?}");
-        assert!(
-            sample.network_rx_bytes.unwrap_or_default() > 4096,
-            "{sample:?}"
-        );
-        assert!(
-            sample.network_tx_bytes.unwrap_or_default() > 4096,
-            "{sample:?}"
-        );
-        assert!(
-            sample.network_rx_bytes_per_sec.unwrap_or_default() > 0.,
-            "{sample:?}"
-        );
-        eprintln!("Live process metrics: {sample:?}");
-    }
-    #[test]
-    fn collector_is_reaped_on_drop() {
-        let mut monitor = Monitor::new(std::process::id(), vm_core::NetworkMode::Disconnected);
-        let child = Command::new("sleep").arg("30").spawn().unwrap();
-        #[cfg(target_os = "macos")]
-        let pid = child.id();
-        monitor.collector = Some(child);
-        drop(monitor);
-        #[cfg(target_os = "macos")]
-        assert!(process_sample(pid).is_none());
     }
 }

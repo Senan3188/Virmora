@@ -15,7 +15,8 @@ Virmora is a macOS VM manager with a Rust backend and a Tauri 2 / React desktop 
 - Keep configuration edits and deletion restricted to stopped machines. Keep graceful shutdown and force stop distinct, and keep disk retention selected by default.
 - Treat the disk, UEFI variables, and Windows TPM state as persistent VM data. Keep the Windows installer and installed-disk modes on the same virtual hardware. Use a fresh temporary VM for destructive or boot tests.
 - Keep VM disks, firmware binaries, installer and driver ISOs, runtime state, logs, generated DMGs, and signing credentials out of Git.
-- Show unavailable metrics as unavailable. Label host measurements separately from guest measurements.
+- Measure CPU and memory at the QEMU process and network bytes at the VM’s virtual NIC. Show unavailable measurements as unavailable and disconnected networking as zero traffic.
+- Keep hardware number fields editable as text while typing. Validate required values and guest limits before converting them to numbers for a Tauri command.
 - Describe networking and guest support based on what the backend actually implements and what has been tested.
 
 ## macOS packaging
@@ -23,6 +24,7 @@ Virmora is a macOS VM manager with a Rust backend and a Tauri 2 / React desktop 
 - Build the native-architecture DMG with `scripts/package-macos.py`. Packaged apps resolve QEMU, swtpm, libraries, and firmware inside the app bundle. Source builds and the CLI use the host runtime.
 - Keep administrator authorization explicit for NAT Network, Bridged, and Host-only. Keep the bundled network helpers linked only against macOS system libraries.
 - Use ad hoc signing for local tests. For a public DMG, use Developer ID signing, notarize and staple the image, and provide corresponding source required by the bundled licenses. See `apps/desktop/README.md`.
+- Keep end-user DMG installation steps in the main README. Document build dependencies separately and link to release assets when published.
 
 ## Verification
 
